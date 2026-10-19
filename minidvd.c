@@ -8,7 +8,6 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/soundcard.h>
 #include <signal.h>
 #include <limits.h>
 #include <sys/time.h>
@@ -27,7 +26,7 @@
 
 #include <a52.h>
 
-#include <asoundlib.h>	//tinyalsa
+#include "audio.h"	//audio/audio.c: tinyalsa + OSS
 
 
 
@@ -72,15 +71,14 @@ static int scale_video = 0;   // toggled by key, eg 'f'
 static int dst_w = 0;
 static int dst_h = 0;
 
-//OSS globals
-static int audio_fd = -1;
+//audio output globals
 static int audio_active = 0;	// stream activity
 
-static int audio_rate = 48000;     // actual OSS rate
-static int audio_channels = 2;     // actual OSS channels
+static int audio_rate = 48000;     // output rate
+static int audio_channels = 2;     // output channels (stereo downmix)
 static int audio_muted = 0;
 static int audio_volume_internal = 100;
-static int audio_ready = 0;   // OSS device state
+static int audio_ready = 0;   // audio device init attempted
 
 //audio globals
 typedef enum {
@@ -168,51 +166,6 @@ static Display *dpy;
 static Window win;
 static GC gc;
 static XImage *ximg;
-
-typedef enum {
-    AUDIO_BACKEND_NONE = 0,
-    AUDIO_BACKEND_TINYALSA,
-    AUDIO_BACKEND_OSS
-} audio_backend_t;
-
-static audio_backend_t audio_backend = AUDIO_BACKEND_NONE;
-
-static struct pcm *pcm_dev = NULL;
-
-int audio_init_tinyalsa(int rate, int channels) {
-    struct pcm_config cfg = {
-        .channels = channels,
-        .rate = rate,
-        .format = PCM_FORMAT_S16_LE,
-        .period_size = 4096,	//1024, 2048, 4096, 8192, 16384
-        .period_count = 4,	//4 seems max
-        .start_threshold = 8192,	//start_threshold = period_size * 2;
-        .stop_threshold = 16384,		//stop_threshold = period_size * period_count;
-        .silence_threshold = 0,
-    };
-
-    pcm_dev = pcm_open(0, 0, PCM_OUT, &cfg);
-    if (!pcm_dev || !pcm_is_ready(pcm_dev)) {
-        fprintf(stderr, "tinyalsa: open failed: %s\n", pcm_get_error(pcm_dev));
-        pcm_dev = NULL;
-        return -1;
-    }
-
-    fprintf(stderr, "Audio: tinyalsa %d Hz, %d ch\n", rate, channels);
-    return 0;
-}
-
-void audio_write_tinyalsa(const int16_t *pcm, int samples) {
-    if (!pcm_dev) return;
-    pcm_write(pcm_dev, pcm, samples * sizeof(int16_t));
-}
-
-void audio_close_tinyalsa(void) {
-    if (pcm_dev) {
-        pcm_close(pcm_dev);
-        pcm_dev = NULL;
-    }
-}
 
 //scaling uses 8.8 fixed-point
 static void scale_bilinear_rgba(uint8_t *dst, int dw, int dh,
@@ -875,90 +828,18 @@ static void ac3_push(uint8_t *data, int len) {
     }
 }
 
-// ------------------ OSS ------------------
-static int audio_init_oss(int rate, int channels) {
-	
-	if (!audio_enabled) { return -1;}
-    int fmt = AFMT_S16_LE;
-    int ch = channels;
-    int r  = rate;
-    audio_fd = open("/dev/dsp", O_WRONLY);
-    if (audio_fd < 0) {
-        fprintf(stderr, "Warning: OSS open failed; continuing without audio.\n");
-        audio_active = 0;
-        return -1;
-    }
-    if (ioctl(audio_fd, SNDCTL_DSP_RESET, 0) < 0) { goto fail;}
-    if (ioctl(audio_fd, SNDCTL_DSP_SETFMT, &fmt) < 0 || fmt != AFMT_S16_LE) { goto fail;}
-    if (ioctl(audio_fd, SNDCTL_DSP_CHANNELS, &ch) < 0) { goto fail;}
-    if (ioctl(audio_fd, SNDCTL_DSP_SPEED, &r) < 0) { goto fail;}
-    // OSS may clamp values — accept what it gives
-    audio_channels = ch;
-    audio_rate     = r;
-    audio_active   = 1;
-    fprintf(stderr, "OSS audio: %d Hz, %d ch, S16_LE\n", r, ch);
-    return 0;
-
-fail:
-    close(audio_fd);
-    audio_fd = -1;
-    audio_active = 0;
-    fprintf(stderr, "OSS audio disabled (unsupported format)\n");
-    return -1;
-}
-
-static void audio_write_oss(const int16_t *pcm, int samples) {
-    if (audio_fd < 0) { return;}
-    write(audio_fd, pcm, samples * sizeof(int16_t));
-}
-
-static void audio_close_oss(void) {
-    if (audio_fd >= 0) {
-        close(audio_fd);
-        audio_fd = -1;
-    }
-}
-
-// ------------------ audio ------------------ 
-int audio_init(int rate, int channels) {
-    if (audio_init_tinyalsa(rate, channels) == 0) {
-        audio_backend = AUDIO_BACKEND_TINYALSA;
+// ------------------ audio ------------------
+// Output goes through audio/audio.c. Order: tinyalsa first, OSS fallback.
+static int audio_open(int rate, int channels) {
+    if (audio_init_backend(AUDIO_BACKEND_TINYALSA, rate, channels) == 0)
         return 0;
-    }
     fprintf(stderr, "Audio: falling back to OSS\n");
-    if (audio_init_oss(rate, channels) == 0) {
-        audio_backend = AUDIO_BACKEND_OSS;
+    if (audio_init_backend(AUDIO_BACKEND_OSS, rate, channels) == 0) {
+        audio_active = 1;
         return 0;
     }
-    audio_backend = AUDIO_BACKEND_NONE;
+    fprintf(stderr, "Warning: no audio device; continuing without audio.\n");
     return -1;
-}
-
-static inline void audio_write(const int16_t *pcm, int samples) {
-    switch (audio_backend) {
-    case AUDIO_BACKEND_TINYALSA:
-        audio_write_tinyalsa(pcm, samples);
-        break;
-    case AUDIO_BACKEND_OSS:
-        audio_write_oss(pcm, samples);
-        break;
-    default:
-        break;
-    }
-}
-
-static void audio_close(void) {
-    switch (audio_backend) {
-    case AUDIO_BACKEND_TINYALSA:
-        audio_close_tinyalsa();
-        break;
-    case AUDIO_BACKEND_OSS:
-        audio_close_oss();
-        break;
-    default:
-        break;
-    }
-    audio_backend = AUDIO_BACKEND_NONE;
 }
 
 // ------------------ X11 ------------------ 
@@ -1045,7 +926,7 @@ static void audio_feed(uint8_t *data, int len, void *opaque) {
 
         }
         int frames = 256;  // a52 always outputs 256 PCM frames per block
-        audio_write(pcm, frames * audio_channels);
+        audio_write(pcm, frames);
     }
 }
 
@@ -1207,11 +1088,6 @@ static void redraw(void) {
     XPutImage(dpy, win, gc, ximg, 0, 0, dx, dy, dst_w, dst_h);
     if (show_help) draw_help_overlay();
     XFlush(dpy);
-}
-
-static void audio_flush(void) {
-    if (audio_fd >= 0)
-        ioctl(audio_fd, SNDCTL_DSP_RESET, 0);
 }
 
 static uint8_t buf[2048];
@@ -1526,7 +1402,7 @@ int main(int argc, char **argv) {
 		playback_step();
 		
 		if (audio_enabled && !audio_ready) {
-			audio_init(audio_rate, audio_channels);
+			audio_open(audio_rate, audio_channels);
 			audio_ready = 1;
 		}
 		

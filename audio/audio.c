@@ -52,6 +52,24 @@ static int oss_fd = -1;
 
 #ifdef AUDIO_HAVE_TINYALSA
 static struct pcm *tiny_pcm;
+
+/*
+ * TinyALSA buffer geometry, overridable at compile time
+ * (e.g. -DAUDIO_TINYALSA_PERIOD_SIZE=4096).
+ * A threshold of 0 means "use the ALSA default".
+ */
+#ifndef AUDIO_TINYALSA_PERIOD_SIZE
+#define AUDIO_TINYALSA_PERIOD_SIZE 1024
+#endif
+#ifndef AUDIO_TINYALSA_PERIOD_COUNT
+#define AUDIO_TINYALSA_PERIOD_COUNT 4
+#endif
+#ifndef AUDIO_TINYALSA_START_THRESHOLD
+#define AUDIO_TINYALSA_START_THRESHOLD 0
+#endif
+#ifndef AUDIO_TINYALSA_STOP_THRESHOLD
+#define AUDIO_TINYALSA_STOP_THRESHOLD 0
+#endif
 #endif
 
 #ifdef AUDIO_HAVE_OSS
@@ -122,6 +140,26 @@ int audio_write(const int16_t *pcm, int frames) {
 #endif
     default:
         return -1;
+    }
+}
+
+/*
+ * Drop audio that is queued but not yet played (e.g. after a seek or a
+ * stream change).
+ * OSS: SNDCTL_DSP_RESET.
+ * TinyALSA: currently a no-op (unchanged minidvd behaviour); the queued
+ * audio simply plays out.
+ */
+void audio_flush(void) {
+    switch (current_backend) {
+#ifdef AUDIO_HAVE_OSS
+    case AUDIO_BACKEND_OSS:
+        if (oss_fd >= 0)
+            (void)ioctl(oss_fd, SNDCTL_DSP_RESET, 0);
+        break;
+#endif
+    default:
+        break;
     }
 }
 
@@ -255,10 +293,10 @@ static int audio_init_tinyalsa(int rate, int channels) {
         .channels = (unsigned int)channels,
         .rate = (unsigned int)rate,
         .format = PCM_FORMAT_S16_LE,
-        .period_size = 1024,
-        .period_count = 4,
-        .start_threshold = 0,
-        .stop_threshold = 0,
+        .period_size = AUDIO_TINYALSA_PERIOD_SIZE,
+        .period_count = AUDIO_TINYALSA_PERIOD_COUNT,
+        .start_threshold = AUDIO_TINYALSA_START_THRESHOLD,
+        .stop_threshold = AUDIO_TINYALSA_STOP_THRESHOLD,
         .silence_threshold = 0
     };
 
