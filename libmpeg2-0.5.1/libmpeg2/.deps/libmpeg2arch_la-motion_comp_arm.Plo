@@ -1,3 +1,0 @@
-libmpeg2arch_la-motion_comp_arm.lo: motion_comp_arm.c ../include/config.h
-
-../include/config.h:
