@@ -1,0 +1,25 @@
+bit_allocate.lo: bit_allocate.c ../include/config.h \
+  /usr/include/inttypes.h /usr/include/features.h \
+  /usr/include/bits/uClibc_config.h /usr/include/sys/cdefs.h \
+  /usr/include/stdint.h /usr/include/bits/wchar.h \
+  /usr/include/bits/wordsize.h ../include/a52.h a52_internal.h
+
+../include/config.h:
+
+/usr/include/inttypes.h:
+
+/usr/include/features.h:
+
+/usr/include/bits/uClibc_config.h:
+
+/usr/include/sys/cdefs.h:
+
+/usr/include/stdint.h:
+
+/usr/include/bits/wchar.h:
+
+/usr/include/bits/wordsize.h:
+
+../include/a52.h:
+
+a52_internal.h:

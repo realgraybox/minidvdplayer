@@ -1,0 +1,255 @@
+NOTICE
+
+This software has been imported, in its original form, as it had
+been historically available on SourceForge [0], into the 'git'
+version control system [1], to better meet the needs of modern
+software distributions. Bug fixes and development occur here.
+
+The canonical URL for source control and issue tracking is now:
+
+    https://git.adelielinux.org/community/a52dec/
+
+Please see the 'CONTRIBUTING' file for more information. Care is
+being taken to minimize churn and follow the original authors'
+intent. The Adélie Linux project is handling maintenance duties.
+
+
+LIBA52
+
+liba52 is a free library for decoding ATSC A/52 streams. It is
+released under the terms of the GPLv2 license.
+
+The A/52 standard, also known as AC-3, is used in a variety of
+applications, including digital television and DVD.
+
+The main goals in liba52 development are:
+
+      * Portability - Currently all of the code is written in C,
+    and when we write platform-specific optimizations we will
+    always keep a generic C routine to fall back on.
+
+      * Reusability - we do not want liba52 to include any
+    project-specific code, but it should still include enough
+    features to be used by very diverse projects.
+
+      * Precision - We are trying to implement all of the A/52
+    standard, and to have a very precise output by doing all the
+    calculations in floating point. We have a test suite that
+    detects any deviation in the output when compared to previous
+    versions. We do not have access to official A/52 test vectors
+    though, so we have to use our judgement to ensure that such
+    deviations are only intruduced when we fix bugs!
+
+      * Speed - liba52 is fast, on any modern PC it should take
+    only a few percent of CPU time.
+
+
+A52DEC
+
+a52dec is a test program for liba52. It decodes ATSC A/52 streams, and
+also includes a demultiplexer for mpeg-1 and mpeg-2 program streams.
+
+The liba52 source code is always distributed in the a52dec package, to
+make sure it easier for people to test it.
+
+The basic usage is to just type "a52dec file" where file is an ATSC
+A/52 file.
+
+The "-s" option must be used for multiplexed (audio and video) mpeg-2
+files. These files are usualy found on the internet or on unencrypted
+DVDs.
+
+The "-o" option is used to select a given output layer. By default
+a52dec does a stereo downmix and outputs to your speakers, but you can
+try other choices using this option. This is also used for performance
+testing and conformance testing.
+
+The "-c" option is used to disable all optimizations (currently only djbfft).
+
+The "-r" option is used to disable the dynamic range compression.
+
+
+OTHER PROJECTS USING LIBA52
+
+liba52 is being used by various other projects, including:
+
+      * xine (https://xine.sourceforge.net/) - started as a simple
+    mpeg-2 audio and video decoder, but it since became a
+    full-featured DVD and video media player.
+
+      * VideoLAN (https://www.videolan.org/) - video streaming over an
+    ethernet network, can also be used as a standalone player.
+
+      * MPlayer (http://www.mplayerhq.hu/) - another good player, it is
+    also very robust against damaged streams.
+
+      * ffmpeg (https://ffmpeg.org/) - a nice audio/video
+    encoder and transcoder, uses liba52 for decoding A/52 streams.
+
+      * drip (https://drip.sourceforge.net/) - a DVD to DIVX transcoder.
+
+      * GStreamer (https://gstreamer.freedesktop.org/) - a framework for
+    streaming media; it has an A/52 decoding plugin based on liba52.
+
+This list is current as of writing. Please review commit history
+for more information, and submit notable projects for inclusion!
+
+
+BUILDING
+
+Released tarballs will include GNU Autotools generated files, so
+there are no explicit dependencies to build this project. If you
+are using the sources from version control or are hacking on it,
+you will need to generate these files yourself. To do this, run:
+
+    ./bootstrap
+
+Then it is a simple matter of:
+
+    ./configure
+    make
+
+etc. Please refer to the 'INSTALL' file for more information.
+
+
+TASKS
+
+There are several places where we could easily use some help:
+
+      * Backports/Triage: A number of issues and patches have been
+    submitted to the mailing lists (see 'MAILING LISTS') in the
+    10 years since the 0.7.4 release. We need help sifting through
+    those messages and determining which, if any, to pursue.
+
+      * Testing: If you find any stream that does not decode right
+    with liba52, let us know ! The best thing would be to mail to
+    the liba52-devel mailing list. Also if you have access to
+    encoders, we'd love to get test streams that would be free of
+    rights - so that we can put them on this server.
+
+      * Coding: You can have a look in the TODO file first ! The most
+    important item is probably to make the code fully reentrant.
+
+      * Porting: If you're porting to a new architecture, you might
+    want to experiment with the compile flags defined in configure.ac.
+    When you've got it working on your platform, send us a patch !
+
+
+MAILING LISTS
+
+SourceForge lists (https://sourceforge.net/p/liba52/mailman/) do
+not seem to be active, and may be read-only. Do not use them. To
+engage with this project, please use the issue tracker or submit
+merge requests as appropriate.
+
+      * liba52-devel - This is the main mailing list for technical
+    discussion about liba52. Anyone wanting to work on liba52, or
+    maybe just stay informed about the development process, should
+    probably subscribe to this list.
+
+      * liba52-checkins - All liba52 checkins are announced there.
+    This is a good way to keep track of what goes into CVS.
+
+      * liba52-announce - This is a very low traffic mailing list,
+    only for announcements of new versions of liba52. Only project
+    administrators can post there.
+
+If crawler-generated read-only archives and original .mbox files
+can be obtained, they will be published in due course, in case
+SourceForge becomes unavailable or adversarial.
+
+
+REFERENCES
+
+The A/52 standard, as published by the ATSC, is available at
+https://www.atsc.org/?s=a%2F52.
+
+[0] The liba52 SourceForge URL of https://liba52.sourceforge.io/
+    is almost as it appeared >20 years ago at the time of the
+    last available release (0.7.4), archived here for posterity:
+    https://web.archive.org/web/20020922173707/http://liba52.sourceforge.net:80/
+
+[1] Note that the project name and CVS modules have changed over
+    time, for these cited reasons, and have divergent histories:
+
+        The other CVS modules are 'ac3dec-livid' for the CVS
+        history of the project while it was still hosted on the
+        linuxvideo.org servers, and 'ac3dec' for the CVS history
+        of the project while the linuxvideo.org servers were down
+        and before the library switched its name to 'liba52'.
+
+    The project source code, http://liba52.cvs.sourceforge.net/,
+    was imported into 'git' on 2022-11-04 using this script:
+
+        https://git.adelielinux.org/-/snippets/171
+
+    History is probably correct but not guaranteed. This process
+    was done twice, using 'git cvsimport' and 'cvs2git', showing
+    identical results (+/- author email address).
+
+    Only the main branch for each module was retained. I checked
+    some of them by hand, and the history was not interesting.
+
+    The 'a52dec' module is the only one actively relevant to the
+    project; it has also been branched as 'current', and this is
+    where development will occur. The modules are now branches.
+
+    In this case, each module was imported as an orphaned branch
+    because it was not immediately clear how to reconcile the
+    histories between the projects. It can likely be done. This
+    assertion is supported by the commit date ranges by branch:
+
+        a52dec
+        ------
+
+        b48f855 Wed Mar  3 09:47:28 2004    Make double preci...
+        ...
+        43f6383 Wed Aug 15 18:36:56 2001    initial import
+
+
+        ac53dec
+        -------
+
+        720e897 Sat Aug 11 01:23:31 2001    typo fix
+        ...
+        2bc4969 Sat May 12 06:44:29 2001    initial import
+
+
+        ac53dec-livid
+        -------------
+
+        bc28385 Wed Mar 14 03:49:02 2001    Fix includes to b...
+        ...
+        f06095b Sun May 16 21:15:39 1999    Initial import
+
+    As another sanity check, the imported data were found to be
+    in sync with the "daily snapshot" available on SourceForge,
+    and spot-checked git tags matched the respective tarballs,
+    with the exception of GNU Autotools files missing.
+
+    All the tags were imported from CVS, but have been manually
+    re-tagged as 'v$VERSION' in the obvious cases. A "release"
+    commit (updated 'ChangeLog', 'NEWS', etc.) was added, tagged
+    as 'v0.7.5', and captures all of the work done since 0.7.4.
+
+        v0.7.5  --> (unreleased work)
+        v0.7.4  --> A52DEC_0_7_4
+        v0.7.3  --> A52DEC_0_7_3
+        v0.7.2  --> A52DEC_0_7_2
+        v0.7.1b --> A52DEC_0_7_1b
+        v0.7.1  --> A52DEC_0_7_1
+        v0.6.0  --> AC3DEC_0_6_0
+        v0.5.6  --> AC3DEC_0_5_6
+        v0.5.5  --> AC3DEC_0_5_5
+        v0.5.4  --> AC3DEC_0_5_4
+        v0.5.3  --> AC3DEC_0_5_3
+        v0.5.0  --> AC3DEC-0_5_0
+
+    Caveat: the 'ChangeLog', commit history, and tarballs may be
+    slightly off. I have not verified each one.
+
+    Caveat: there exists a '0.6.1' release tarball, but there is
+    no corresponding commit or tag. Some digging may be needed.
+
+    Caveat: more recent checkins are referenced on the mailing
+    list ('liba52-checkins'), and I'm not sure how to find them.

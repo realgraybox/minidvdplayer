@@ -26,7 +26,9 @@ $(error Unsupported target: $(TARGET_MACHINE))
 
 endif
 
-SRCS = minidvd.c audio/audio.c audio/pcm.c
+#audio/audio.c
+
+SRCS = minidvd.c audio/pcm.c
 
 OBJS= $(SRCS:.c=.o)
 

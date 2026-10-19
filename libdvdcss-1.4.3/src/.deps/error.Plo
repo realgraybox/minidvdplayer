@@ -1,0 +1,103 @@
+src/error.lo: src/error.c \
+  /usr/lib/gcc/i386-linux-uclibc/3.4.3/include/stdarg.h \
+  /usr/include/stdio.h /usr/include/features.h \
+  /usr/include/bits/uClibc_config.h /usr/include/sys/cdefs.h \
+  /usr/lib/gcc/i386-linux-uclibc/3.4.3/include/stddef.h \
+  /usr/include/bits/types.h /usr/include/bits/kernel_types.h \
+  /usr/include/bits/pthreadtypes.h /usr/include/bits/sched.h \
+  /usr/include/bits/uClibc_stdio.h /usr/include/wchar.h \
+  /usr/include/bits/wchar.h /usr/include/bits/stdio_lim.h src/libdvdcss.h \
+  /usr/lib/gcc/i386-linux-uclibc/3.4.3/include/limits.h \
+  /usr/lib/gcc/i386-linux-uclibc/3.4.3/include/syslimits.h \
+  /usr/include/limits.h /usr/include/bits/posix1_lim.h \
+  /usr/include/bits/local_lim.h /usr/include/linux/limits.h \
+  /usr/include/bits/posix2_lim.h /usr/include/bits/xopen_lim.h \
+  src/dvdcss/dvdcss.h /usr/include/stdint.h /usr/include/bits/wordsize.h \
+  src/dvdcss/version.h src/css.h src/device.h ./config.h \
+  /usr/include/sys/types.h /usr/include/time.h /usr/include/endian.h \
+  /usr/include/bits/endian.h /usr/include/sys/select.h \
+  /usr/include/bits/select.h /usr/include/bits/sigset.h \
+  /usr/include/bits/time.h /usr/include/sys/sysmacros.h \
+  /usr/include/sys/uio.h /usr/include/bits/uio.h
+
+/usr/lib/gcc/i386-linux-uclibc/3.4.3/include/stdarg.h:
+
+/usr/include/stdio.h:
+
+/usr/include/features.h:
+
+/usr/include/bits/uClibc_config.h:
+
+/usr/include/sys/cdefs.h:
+
+/usr/lib/gcc/i386-linux-uclibc/3.4.3/include/stddef.h:
+
+/usr/include/bits/types.h:
+
+/usr/include/bits/kernel_types.h:
+
+/usr/include/bits/pthreadtypes.h:
+
+/usr/include/bits/sched.h:
+
+/usr/include/bits/uClibc_stdio.h:
+
+/usr/include/wchar.h:
+
+/usr/include/bits/wchar.h:
+
+/usr/include/bits/stdio_lim.h:
+
+src/libdvdcss.h:
+
+/usr/lib/gcc/i386-linux-uclibc/3.4.3/include/limits.h:
+
+/usr/lib/gcc/i386-linux-uclibc/3.4.3/include/syslimits.h:
+
+/usr/include/limits.h:
+
+/usr/include/bits/posix1_lim.h:
+
+/usr/include/bits/local_lim.h:
+
+/usr/include/linux/limits.h:
+
+/usr/include/bits/posix2_lim.h:
+
+/usr/include/bits/xopen_lim.h:
+
+src/dvdcss/dvdcss.h:
+
+/usr/include/stdint.h:
+
+/usr/include/bits/wordsize.h:
+
+src/dvdcss/version.h:
+
+src/css.h:
+
+src/device.h:
+
+./config.h:
+
+/usr/include/sys/types.h:
+
+/usr/include/time.h:
+
+/usr/include/endian.h:
+
+/usr/include/bits/endian.h:
+
+/usr/include/sys/select.h:
+
+/usr/include/bits/select.h:
+
+/usr/include/bits/sigset.h:
+
+/usr/include/bits/time.h:
+
+/usr/include/sys/sysmacros.h:
+
+/usr/include/sys/uio.h:
+
+/usr/include/bits/uio.h:
