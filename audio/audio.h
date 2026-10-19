@@ -28,7 +28,8 @@
 enum audio_backend {
 	AUDIO_BACKEND_NONE = 0,
     AUDIO_BACKEND_OSS,
-    AUDIO_BACKEND_TINYALSA
+    AUDIO_BACKEND_TINYALSA,
+    AUDIO_BACKEND_SIM          /* test-only simulated device */
 };
 
 /*
@@ -41,6 +42,15 @@ int  audio_init(int rate, int channels);
 int  audio_init_backend(enum audio_backend backend, int rate, int channels);
 int  audio_write(const int16_t *pcm, int samples);
 void audio_flush(void);
+
+/* Frames queued in the device but not yet played; -1 if unknown. */
+int  audio_get_delay(void);
+/* Frames that can be written now without blocking; -1 if unknown. */
+int  audio_get_space(void);
+
+#ifdef AUDIO_HAVE_SIM
+int  audio_sim_true_delay(void);
+#endif
 void audio_close(void);
 
 enum audio_backend audio_get_backend(void);

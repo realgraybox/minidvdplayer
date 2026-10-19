@@ -14,6 +14,7 @@
 #   LIB_CFLAGS  CFLAGS for the bundled libraries
 #   LIB_LDFLAGS LDFLAGS for the bundled libraries
 #   X11_LIBS    X11 link line (defaults to pkg-config --static, else -lX11)
+#   SYNC        'old' builds the previous A/V timing (see minidvd.c)
 
 CC ?= gcc
 ifeq ($(origin CC),default)
@@ -98,13 +99,21 @@ AUDIO_CFLAGS = -DAUDIO_HAVE_TINYALSA -DAUDIO_HAVE_OSS \
 
 OBJS= $(SRCS:.c=.o)
 
+# A/V timing: 'make' = frames shown at their PTS against an audio-locked clock,
+# 'make SYNC=old' = previous behaviour (video paced by blocking audio writes).
+# Run 'make clean' when switching.
+SYNC ?= new
+ifeq ($(SYNC),old)
+SYNC_CFLAGS = -DSYNC_OLD
+endif
+
 TARGET = minidvd
 
 CFLAGS += -Wall -Wunused -std=gnu99 -I./$(DVDREAD_DIR)/src -I./ \
 		-I./$(MPEG2_DIR)/include -I./$(A52_DIR)/include -I./audio \
 		-Os -ffunction-sections -fdata-sections -Wno-deprecated-declarations \
 		-ffast-math -fno-math-errno -DCLOCK_MONOTONIC=CLOCK_REALTIME -DLOGGING \
-		$(AUDIO_CFLAGS)
+		$(AUDIO_CFLAGS) $(SYNC_CFLAGS) $(EXTRA_CFLAGS)
 
 X11_LIBS ?= $(shell pkg-config --static --libs x11 2>/dev/null || echo -lX11)
 
