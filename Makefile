@@ -139,10 +139,11 @@ $(DVDREAD_DIR)/$(LIB_STAMP): $(DVDREAD_DIR)/$(LIB_STAMP_SIG) $(DVDCSS_DIR)/$(LIB
 	cd $(DVDREAD_DIR) && CPPFLAGS="-I$(CURDIR)/$(DVDCSS_DIR)/src" \
 		$(CONFIGURE) --with-libdvdcss \
 		CSS_CFLAGS="-I$(CURDIR)/$(DVDCSS_DIR)/src" \
-		CSS_LIBS="$(CURDIR)/$(DVDCSS_A)"
+		CSS_LIBS="-L$(CURDIR)/$(DVDCSS_DIR)/.libs -ldvdcss"
 	touch $@
 
-$(DVDREAD_A): $(DVDREAD_DIR)/$(LIB_STAMP) FORCE
+# libdvdread links against the bundled libdvdcss (CSS_LIBS): build that first
+$(DVDREAD_A): $(DVDREAD_DIR)/$(LIB_STAMP) $(DVDCSS_A) FORCE
 	$(MAKE) -C $(DVDREAD_DIR) $(NO_AUTOTOOLS) libdvdread.la
 
 # --- libmpeg2 + libmpeg2convert ---------------------------------------------
