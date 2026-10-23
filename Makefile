@@ -1,4 +1,4 @@
-# minidvd - tiny static DVD player
+# minidvd - tiny DVD player (static binary with uClibc)
 #
 #   make              configure + build the bundled libraries, then minidvd
 #   make libs         only build the bundled libraries
@@ -13,7 +13,8 @@
 #   HOST        autoconf --host triplet, only needed when cross compiling
 #   LIB_CFLAGS  CFLAGS for the bundled libraries
 #   LIB_LDFLAGS LDFLAGS for the bundled libraries
-#   X11_LIBS    X11 link line (defaults to pkg-config --static, else -lX11)
+#   X11_LIBS    X11 link line (defaults to pkg-config, else -lX11)
+#   STATIC      '-static' to link statically; default only for uClibc compilers
 #   SYNC        'old' builds the previous A/V timing (see minidvd.c)
 
 CC ?= gcc
@@ -34,8 +35,7 @@ ELF_ARCH   = i386:x86-64
 else ifneq ($(findstring i386,$(TARGET_MACHINE)),)
 
 ELF_ARCH   = i386
-STATIC = -static
-CFLAGS += -fno-builtin-pow -fno-builtin-exp -DCLOCK_MONOTONIC=CLOCK_REALTIME
+CFLAGS += -fno-builtin-pow -fno-builtin-exp
 
 else ifneq ($(findstring i686,$(TARGET_MACHINE)),)
 
@@ -46,6 +46,15 @@ else
 
 $(error Unsupported target: $(TARGET_MACHINE))
 
+endif
+
+# uClibc: fully static binary, and its clock_gettime lacks CLOCK_MONOTONIC.
+# Everything else (glibc, ...): normal dynamically linked binary.
+ifneq ($(findstring uclibc,$(TARGET_MACHINE)),)
+STATIC ?= -static
+CFLAGS += -DCLOCK_MONOTONIC=CLOCK_REALTIME
+else
+STATIC ?=
 endif
 
 # ---------------------------------------------------------------------------
@@ -68,7 +77,7 @@ LIB_ARCHIVES = $(DVDREAD_A) $(DVDCSS_A) $(MPEG2CONVERT_A) $(MPEG2_A) $(A52_A)
 
 LIB_CFLAGS  ?= -pipe -Os -Wall -D_BSD_SOURCE -D_GNU_SOURCE -D__KERNEL_STRICT_NAMES \
                -ffunction-sections -fdata-sections
-LIB_LDFLAGS ?= -static -Wl,--gc-sections,--sort-common,-s
+LIB_LDFLAGS ?= $(STATIC) -Wl,--gc-sections,--sort-common,-s
 
 # Common configure invocation for all libraries (run inside the lib dir).
 CONFIGURE = CC="$(CC)" CFLAGS="$(LIB_CFLAGS)" LDFLAGS="$(LIB_LDFLAGS)" \
@@ -112,12 +121,12 @@ TARGET = minidvd
 CFLAGS += -Wall -Wunused -std=gnu99 -I./$(DVDREAD_DIR)/src -I./ \
 		-I./$(MPEG2_DIR)/include -I./$(A52_DIR)/include -I./audio \
 		-Os -ffunction-sections -fdata-sections -Wno-deprecated-declarations \
-		-ffast-math -fno-math-errno -DCLOCK_MONOTONIC=CLOCK_REALTIME -DLOGGING \
+		-ffast-math -fno-math-errno -DLOGGING \
 		$(AUDIO_CFLAGS) $(SYNC_CFLAGS) $(EXTRA_CFLAGS)
 
-X11_LIBS ?= $(shell pkg-config --static --libs x11 2>/dev/null || echo -lX11)
+X11_LIBS ?= $(shell pkg-config $(if $(STATIC),--static) --libs x11 2>/dev/null || echo -lX11)
 
-LDFLAGS = -static -Wl,--gc-sections,--sort-common,-s
+LDFLAGS = $(STATIC) -Wl,--gc-sections,--sort-common,-s
 LDLIBS  = $(LIB_ARCHIVES) $(X11_LIBS) -lm
 
 .PHONY: all libs clean libs-clean distclean install FORCE
