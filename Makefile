@@ -88,9 +88,13 @@ LIB_STAMP      = .minidvd-configured
 # minidvd
 # ---------------------------------------------------------------------------
 
-#audio/audio.c
+SRCS = minidvd.c audio/audio.c audio/pcm.c
 
-SRCS = minidvd.c audio/pcm.c
+# audio/audio.c: backends + tinyalsa buffer geometry used by minidvd
+# (period 4096 frames x 4, start after 8192 frames, stop below 16384)
+AUDIO_CFLAGS = -DAUDIO_HAVE_TINYALSA -DAUDIO_HAVE_OSS \
+		-DAUDIO_TINYALSA_PERIOD_SIZE=4096 -DAUDIO_TINYALSA_PERIOD_COUNT=4 \
+		-DAUDIO_TINYALSA_START_THRESHOLD=8192 -DAUDIO_TINYALSA_STOP_THRESHOLD=16384
 
 OBJS= $(SRCS:.c=.o)
 
@@ -99,7 +103,8 @@ TARGET = minidvd
 CFLAGS += -Wall -Wunused -std=gnu99 -I./$(DVDREAD_DIR)/src -I./ \
 		-I./$(MPEG2_DIR)/include -I./$(A52_DIR)/include -I./audio \
 		-Os -ffunction-sections -fdata-sections -Wno-deprecated-declarations \
-		-ffast-math -fno-math-errno -DCLOCK_MONOTONIC=CLOCK_REALTIME -DLOGGING
+		-ffast-math -fno-math-errno -DCLOCK_MONOTONIC=CLOCK_REALTIME -DLOGGING \
+		$(AUDIO_CFLAGS)
 
 X11_LIBS ?= $(shell pkg-config --static --libs x11 2>/dev/null || echo -lX11)
 
