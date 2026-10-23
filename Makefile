@@ -1,6 +1,27 @@
+# minidvd - tiny static DVD player
+#
+#   make              configure + build the bundled libraries, then minidvd
+#   make libs         only build the bundled libraries
+#   make clean        remove minidvd objects/binary
+#   make libs-clean   run 'make clean' in every bundled library
+#   make distclean    clean + remove all configure output from the libraries
+#
+# Overridable on the command line, e.g.
+#   make CC=/opt/uclibc/bin/i386-linux-gcc HOST=i386-linux-uclibc
+#
+#   CC          compiler used for minidvd AND the bundled libraries
+#   HOST        autoconf --host triplet, only needed when cross compiling
+#   LIB_CFLAGS  CFLAGS for the bundled libraries
+#   LIB_LDFLAGS LDFLAGS for the bundled libraries
+#   X11_LIBS    X11 link line (defaults to pkg-config --static, else -lX11)
+
+CC ?= gcc
+ifeq ($(origin CC),default)
 CC = gcc
+endif
 
 BINDIR = /usr/bin
+HOST   ?=
 
 TARGET_MACHINE := $(shell $(CC) -dumpmachine)
 
@@ -10,7 +31,7 @@ ELF_FORMAT = elf64-x86-64
 ELF_ARCH   = i386:x86-64
 
 else ifneq ($(findstring i386,$(TARGET_MACHINE)),)
-	
+
 ELF_ARCH   = i386
 STATIC = -static
 CFLAGS += -fno-builtin-pow -fno-builtin-exp -DCLOCK_MONOTONIC=CLOCK_REALTIME
@@ -26,6 +47,47 @@ $(error Unsupported target: $(TARGET_MACHINE))
 
 endif
 
+# ---------------------------------------------------------------------------
+# Bundled libraries
+# ---------------------------------------------------------------------------
+
+DVDCSS_DIR  = libdvdcss-1.4.3
+DVDREAD_DIR = libdvdread-5.0.3
+MPEG2_DIR   = libmpeg2-0.5.1
+A52_DIR     = a52dec-0.8.0
+
+DVDCSS_A       = $(DVDCSS_DIR)/.libs/libdvdcss.a
+DVDREAD_A      = $(DVDREAD_DIR)/.libs/libdvdread.a
+MPEG2_A        = $(MPEG2_DIR)/libmpeg2/.libs/libmpeg2.a
+MPEG2CONVERT_A = $(MPEG2_DIR)/libmpeg2/convert/.libs/libmpeg2convert.a
+A52_A          = $(A52_DIR)/liba52/.libs/liba52.a
+
+# link order matters for static archives: users before providers
+LIB_ARCHIVES = $(DVDREAD_A) $(DVDCSS_A) $(MPEG2CONVERT_A) $(MPEG2_A) $(A52_A)
+
+LIB_CFLAGS  ?= -pipe -Os -Wall -D_BSD_SOURCE -D_GNU_SOURCE -D__KERNEL_STRICT_NAMES \
+               -ffunction-sections -fdata-sections
+LIB_LDFLAGS ?= -static -Wl,--gc-sections,--sort-common,-s
+
+# Common configure invocation for all libraries (run inside the lib dir).
+CONFIGURE = CC="$(CC)" CFLAGS="$(LIB_CFLAGS)" LDFLAGS="$(LIB_LDFLAGS)" \
+            $(SHELL) ./configure --prefix=/usr --disable-silent-rules \
+            --disable-shared --enable-static $(if $(HOST),--host=$(HOST))
+
+# git checkouts scramble timestamps; never let the generated Makefiles try
+# to re-run aclocal/automake/autoconf/autoheader.
+NO_AUTOTOOLS = ACLOCAL=true AUTOMAKE=true AUTOCONF=true AUTOHEADER=true
+
+# Anything that changes how the libraries are configured goes in here. When it
+# changes, the libraries are reconfigured automatically.
+LIB_CONFIG_SIG = $(CC)|$(HOST)|$(LIB_CFLAGS)|$(LIB_LDFLAGS)
+LIB_STAMP_SIG  = .minidvd-config
+LIB_STAMP      = .minidvd-configured
+
+# ---------------------------------------------------------------------------
+# minidvd
+# ---------------------------------------------------------------------------
+
 #audio/audio.c
 
 SRCS = minidvd.c audio/pcm.c
@@ -34,27 +96,95 @@ OBJS= $(SRCS:.c=.o)
 
 TARGET = minidvd
 
-CFLAGS += -Wall -Wunused -std=gnu99 -I./libdvdread-5.0.3/src -I./ \
-		-I./libmpeg2-0.5.1/include -I./a52dec-0.8.0/include -I./audio \
+CFLAGS += -Wall -Wunused -std=gnu99 -I./$(DVDREAD_DIR)/src -I./ \
+		-I./$(MPEG2_DIR)/include -I./$(A52_DIR)/include -I./audio \
 		-Os -ffunction-sections -fdata-sections -Wno-deprecated-declarations \
 		-ffast-math -fno-math-errno -DCLOCK_MONOTONIC=CLOCK_REALTIME -DLOGGING
 
-LDFLAGS =  -static  -Wl,--gc-sections,--sort-common,-s ./libdvdread-5.0.3/.libs/libdvdread.a \
-			./libmpeg2-0.5.1/libmpeg2/.libs/libmpeg2.a \
-			./libmpeg2-0.5.1/libmpeg2/convert/.libs/libmpeg2convert.a \
-			./a52dec-0.8.0/liba52/.libs/liba52.a \
-			./libdvdcss-1.4.3/.libs/libdvdcss.a -lX11 -lm
-			
-.PHONY: all clean install
+X11_LIBS ?= $(shell pkg-config --static --libs x11 2>/dev/null || echo -lX11)
 
-all:  $(TARGET)
+LDFLAGS = -static -Wl,--gc-sections,--sort-common,-s
+LDLIBS  = $(LIB_ARCHIVES) $(X11_LIBS) -lm
 
-$(TARGET): $(OBJS) 
-	$(CC) -o $@ $^ $(LDFLAGS) $(CFLAGS)
+.PHONY: all libs clean libs-clean distclean install FORCE
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS) $(LIB_ARCHIVES)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS) $(LDLIBS)
+
+# library headers must be in place (and configured) before compiling
+$(OBJS): | $(DVDCSS_DIR)/$(LIB_STAMP) $(DVDREAD_DIR)/$(LIB_STAMP) \
+           $(MPEG2_DIR)/$(LIB_STAMP) $(A52_DIR)/$(LIB_STAMP)
+
+libs: $(LIB_ARCHIVES)
+
+# --- configuration signature: rewritten only when the settings change ------
+
+%/$(LIB_STAMP_SIG): FORCE
+	@echo '$(LIB_CONFIG_SIG)' | cmp -s - $@ || echo '$(LIB_CONFIG_SIG)' > $@
+
+# --- libdvdcss ---------------------------------------------------------------
+
+$(DVDCSS_DIR)/$(LIB_STAMP): $(DVDCSS_DIR)/$(LIB_STAMP_SIG)
+	cd $(DVDCSS_DIR) && $(CONFIGURE) ac_cv_func_dlopen=no
+	touch $@
+
+$(DVDCSS_A): $(DVDCSS_DIR)/$(LIB_STAMP) FORCE
+	$(MAKE) -C $(DVDCSS_DIR) $(NO_AUTOTOOLS) libdvdcss.la
+
+# --- libdvdread (linked directly against the bundled libdvdcss) ---------------
+
+$(DVDREAD_DIR)/$(LIB_STAMP): $(DVDREAD_DIR)/$(LIB_STAMP_SIG) $(DVDCSS_DIR)/$(LIB_STAMP)
+	cd $(DVDREAD_DIR) && CPPFLAGS="-I$(CURDIR)/$(DVDCSS_DIR)/src" \
+		$(CONFIGURE) --with-libdvdcss \
+		CSS_CFLAGS="-I$(CURDIR)/$(DVDCSS_DIR)/src" \
+		CSS_LIBS="-L$(CURDIR)/$(DVDCSS_DIR)/.libs -ldvdcss"
+	touch $@
+
+# libdvdread links against the bundled libdvdcss (CSS_LIBS): build that first
+$(DVDREAD_A): $(DVDREAD_DIR)/$(LIB_STAMP) $(DVDCSS_A) FORCE
+	$(MAKE) -C $(DVDREAD_DIR) $(NO_AUTOTOOLS) libdvdread.la
+
+# --- libmpeg2 + libmpeg2convert ---------------------------------------------
+
+$(MPEG2_DIR)/$(LIB_STAMP): $(MPEG2_DIR)/$(LIB_STAMP_SIG)
+	cd $(MPEG2_DIR) && $(CONFIGURE) --disable-sdl --without-x
+	touch $@
+
+$(MPEG2_A): $(MPEG2_DIR)/$(LIB_STAMP) FORCE
+	$(MAKE) -C $(MPEG2_DIR)/libmpeg2 $(NO_AUTOTOOLS)
+
+# built by the same sub-make as libmpeg2.a (one recipe, safe with -j)
+$(MPEG2CONVERT_A): $(MPEG2_A) ;
+
+# --- liba52 -------------------------------------------------------------------
+
+$(A52_DIR)/$(LIB_STAMP): $(A52_DIR)/$(LIB_STAMP_SIG)
+	cd $(A52_DIR) && $(CONFIGURE)
+	touch $@
+
+$(A52_A): $(A52_DIR)/$(LIB_STAMP) FORCE
+	$(MAKE) -C $(A52_DIR)/liba52 $(NO_AUTOTOOLS)
+
+# ---------------------------------------------------------------------------
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/
-	
+
 clean:
 	rm -f $(TARGET) $(OBJS)
+
+libs-clean:
+	for d in $(DVDCSS_DIR) $(DVDREAD_DIR) $(MPEG2_DIR) $(A52_DIR); do \
+		if [ -f $$d/Makefile ]; then $(MAKE) -C $$d $(NO_AUTOTOOLS) clean; fi; \
+	done
+
+distclean: clean
+	for d in $(DVDCSS_DIR) $(DVDREAD_DIR) $(MPEG2_DIR) $(A52_DIR); do \
+		if [ -f $$d/Makefile ]; then $(MAKE) -C $$d $(NO_AUTOTOOLS) distclean; fi; \
+		rm -f $$d/$(LIB_STAMP) $$d/$(LIB_STAMP_SIG); \
+	done
+
+FORCE:
