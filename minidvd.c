@@ -30,6 +30,18 @@
 
 
 
+/*
+ * A/V timing
+ *   default:       every video frame is shown at its PTS, measured against a
+ *                  clock that is locked to the audio playback position.
+ *                  Audio is written without blocking, so it never stalls video.
+ *   -DSYNC_OLD:    previous behaviour: video is paced by blocking audio writes
+ *                  (plus the LOGGING "pacemaker").
+ * Test hooks (not for normal builds):
+ *   -DTEST_PLAIN_VOB   argv[1] is a plain MPEG-PS/VOB file instead of a DVD
+ *   -DAUDIO_HAVE_SIM   simulated sound card; prints per-frame "AV" log lines
+ */
+
 //frame/redraw logning
 #ifdef LOGGING
 // Globale eller statiske variabler til at huske tiden
@@ -51,10 +63,12 @@ static uint32_t dvd_block;        // current read block
 static uint32_t total_blocks;
 
 //ps_demux globals
+#ifdef SYNC_OLD
 #define VIDEO_ES_BUF_SIZE (512 * 1024)
 static uint8_t video_es_buf[VIDEO_ES_BUF_SIZE];
 
 static int video_es_len = 0;
+#endif
 
 static int seek_pending = 0;
 static uint32_t seek_target_block = 0;
@@ -762,6 +776,93 @@ static void toggle_fullscreen(Display *dpy, Window win) {
                &e);
 }
 
+// ------------------ A/V timing core ------------------
+#define PTS_NONE INT64_MIN
+#define PTS_HZ   90000
+
+static __attribute__((unused)) int64_t now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+// PTS of the PES packet starting at p (00 00 01 id ...), or PTS_NONE
+static int64_t pes_get_pts(const uint8_t *p, int avail) {
+    if (avail < 14) return PTS_NONE;
+    if ((p[6] & 0xC0) != 0x80) return PTS_NONE;   // not an MPEG-2 PES header
+    if (!(p[7] & 0x80)) return PTS_NONE;          // no PTS in this packet
+    return ((int64_t)(p[9] & 0x0E) << 29) | ((int64_t)p[10] << 22) |
+           ((int64_t)(p[11] & 0xFE) << 14) | ((int64_t)p[12] << 7) |
+           (p[13] >> 1);
+}
+
+// Audio timestamps. A PES PTS belongs to the first AC3 frame that starts in
+// that packet (at the "first access unit" offset), so positions are tracked
+// as byte offsets into the AC3 stream fed to ac3_push().
+static int64_t aq_end_pts = PTS_NONE;     // pts just after the last decoded audio
+static __attribute__((unused)) int aq_fill = 0;  // decoded frames queued, not yet in device
+static int64_t ac3_frame_pts = PTS_NONE;  // pts of the AC3 frame being decoded
+static uint64_t ac3_in_pos = 0;           // AC3 bytes consumed so far
+static uint64_t ac3_frame_pos = 0;        // stream position of current frame
+#define AC3_PTSQ 16
+static struct { uint64_t pos; int64_t pts; } ac3_ptsq[AC3_PTSQ];
+static int ac3_ptsq_n = 0;
+
+static void ac3_pts_register(uint64_t pos, int64_t pts) {
+    if (ac3_ptsq_n == AC3_PTSQ) {
+        memmove(ac3_ptsq, ac3_ptsq + 1, (AC3_PTSQ - 1) * sizeof(ac3_ptsq[0]));
+        ac3_ptsq_n--;
+    }
+    ac3_ptsq[ac3_ptsq_n].pos = pos;
+    ac3_ptsq[ac3_ptsq_n].pts = pts;
+    ac3_ptsq_n++;
+}
+
+static int64_t ac3_pts_lookup(uint64_t frame_pos) {
+    int64_t pts = PTS_NONE;
+    int i = 0;
+    while (i < ac3_ptsq_n && ac3_ptsq[i].pos <= frame_pos) {
+        if (ac3_ptsq[i].pos == frame_pos)
+            pts = ac3_ptsq[i].pts;
+        i++;
+    }
+    memmove(ac3_ptsq, ac3_ptsq + i, (ac3_ptsq_n - i) * sizeof(ac3_ptsq[0]));
+    ac3_ptsq_n -= i;
+    return pts;
+}
+
+static void ac3_reset(void) {
+    ac3_len = 0;
+    ac3_need = 0;
+    ac3_ptsq_n = 0;
+    ac3_frame_pts = PTS_NONE;
+}
+
+#ifndef SYNC_OLD
+// Decoded audio waiting for room in the sound card (1 s, stereo s16).
+#define AQ_FRAMES 48000
+static int16_t aq_buf[AQ_FRAMES * 2];
+static int aq_rd = 0;
+
+static void aq_push(const int16_t *pcm, int frames) {
+    if (frames > AQ_FRAMES - aq_fill) {           // should not happen: reader checks space
+        int drop = frames - (AQ_FRAMES - aq_fill);
+        aq_rd = (aq_rd + drop) % AQ_FRAMES;
+        aq_fill -= drop;
+    }
+    int wr = (aq_rd + aq_fill) % AQ_FRAMES;
+    while (frames > 0) {
+        int n = frames;
+        if (n > AQ_FRAMES - wr) n = AQ_FRAMES - wr;
+        memcpy(aq_buf + wr * 2, pcm, n * 2 * sizeof(int16_t));
+        pcm += n * 2;
+        frames -= n;
+        aq_fill += n;
+        wr = (wr + n) % AQ_FRAMES;
+    }
+}
+#endif
+
 static inline int16_t sample_to_s16(sample_t s) {
 #if defined(LIBA52_FIXED)
     return s >> 15;
@@ -778,6 +879,7 @@ static void ac3_push(uint8_t *data, int len) {
         if (ac3_len < 2) {
             ac3_buf[ac3_len++] = *data++;
             len--;
+            ac3_in_pos++;
             continue;
         }
         if (!(ac3_buf[0] == 0x0B && ac3_buf[1] == 0x77)) {
@@ -789,6 +891,7 @@ static void ac3_push(uint8_t *data, int len) {
         while (ac3_len < 7 && len > 0) {
             ac3_buf[ac3_len++] = *data++;
             len--;
+            ac3_in_pos++;
         }
         if (ac3_len < 7) { return;}
         // Determine frame size
@@ -802,6 +905,7 @@ static void ac3_push(uint8_t *data, int len) {
                 continue;
             }
             ac3_need = sz;
+            ac3_frame_pos = ac3_in_pos - ac3_len;   // where this frame started
         }
         // Copy remaining data
         int copy = ac3_need - ac3_len;
@@ -810,6 +914,7 @@ static void ac3_push(uint8_t *data, int len) {
         ac3_len += copy;
         data += copy;
         len -= copy;
+        ac3_in_pos += copy;
         // Full frame ready
         if (ac3_len == ac3_need) {
 			int flags, rate, bitrate;
@@ -820,6 +925,7 @@ static void ac3_push(uint8_t *data, int len) {
 				ac3_need = 0;
 				continue;
 			}
+            ac3_frame_pts = ac3_pts_lookup(ac3_frame_pos);
             audio_feed(ac3_buf, ac3_need, NULL);
          //   fprintf(stderr, "AC3 sync: frame_len=%d rate=%d bitrate=%d\n", ac3_need, rate, bitrate);
             ac3_len = 0;
@@ -831,6 +937,9 @@ static void ac3_push(uint8_t *data, int len) {
 // ------------------ audio ------------------
 // Output goes through audio/audio.c. Order: tinyalsa first, OSS fallback.
 static int audio_open(int rate, int channels) {
+#ifdef AUDIO_HAVE_SIM
+    return audio_init_backend(AUDIO_BACKEND_SIM, rate, channels);
+#endif
     if (audio_init_backend(AUDIO_BACKEND_TINYALSA, rate, channels) == 0)
         return 0;
     fprintf(stderr, "Audio: falling back to OSS\n");
@@ -885,6 +994,7 @@ typedef struct {
     int active;
     int expected;
     int collected;
+    int64_t pts;
     uint8_t buf[MAX_SPU_SIZE];
 } spu_assembler_t;
 
@@ -894,6 +1004,7 @@ static spu_assembler_t spu[0x20];   // one per substream (0x20–0x3F)
 static void audio_feed(uint8_t *data, int len, void *opaque) {
 	if (!audio_enabled || audio_type != AUDIO_AC3) { return;}
 	audio_bytes += len;
+	if (ac3_frame_pts != PTS_NONE) { aq_end_pts = ac3_frame_pts;}
     int flags = A52_STEREO;
     sample_t level = 1.0;
     sample_t bias = 0.0;
@@ -926,11 +1037,18 @@ static void audio_feed(uint8_t *data, int len, void *opaque) {
 
         }
         int frames = 256;  // a52 always outputs 256 PCM frames per block
+#ifdef SYNC_OLD
         audio_write(pcm, frames);
+#else
+        aq_push(pcm, frames);
+#endif
+        if (aq_end_pts != PTS_NONE) { aq_end_pts += (int64_t)frames * PTS_HZ / audio_rate;}
     }
 }
 
-static void video_feed(uint8_t *data, int len) {
+#ifdef SYNC_OLD
+static void video_feed(uint8_t *data, int len, int64_t pts) {
+	(void)pts;
 	if (video_es_len + len > VIDEO_ES_BUF_SIZE) {
 		fprintf(stderr, "ES buffer overflow — dropping data\n");
         video_es_len = 0;
@@ -938,6 +1056,51 @@ static void video_feed(uint8_t *data, int len) {
     memcpy(video_es_buf + video_es_len, data, len);
     video_es_len += len;
 }
+#else
+// Compressed video waiting for the decoder: one slot per PES payload, with
+// its PTS. Lets the reader run ahead of the display without decoding early.
+#define VQ_SLOTS 512                      // 1 MB, roughly 1-2 s of DVD video
+static uint8_t  vq_data[VQ_SLOTS][2048];
+static uint16_t vq_len[VQ_SLOTS];
+static int64_t  vq_pts[VQ_SLOTS];
+static int vq_tail = 0, vq_count = 0;
+static int64_t vq_last_pts = PTS_NONE;   // newest video pts read from the disc
+
+static void video_feed(uint8_t *data, int len, int64_t pts) {
+    if (len <= 0) return;
+    if (len > 2048) len = 2048;
+    if (vq_count == VQ_SLOTS) {
+        fprintf(stderr, "video queue overflow — dropping data\n");
+        return;
+    }
+    int slot = (vq_tail + vq_count) % VQ_SLOTS;
+    memcpy(vq_data[slot], data, len);
+    vq_len[slot] = (uint16_t)len;
+    vq_pts[slot] = pts;
+    vq_count++;
+    if (pts != PTS_NONE) vq_last_pts = pts;
+}
+
+// Subtitle waiting for its PTS
+static uint8_t spu_pending[MAX_SPU_SIZE];
+static int spu_pending_len = 0;
+static int64_t spu_pending_pts = PTS_NONE;
+
+static void spu_show_pending(void) {
+    struct spu_state st;
+    memset(&st, 0, sizeof(st));
+    spu_demux_control(spu_pending, spu_pending_len, &st);
+    spu_pending_len = 0;
+}
+
+static void spu_queue(const uint8_t *data, int len, int64_t pts) {
+    if (spu_pending_len)
+        spu_show_pending();               // an older one is still waiting: show it now
+    memcpy(spu_pending, data, len);
+    spu_pending_len = len;
+    spu_pending_pts = pts;
+}
+#endif
 
 static void demux_ps(uint8_t *buf, int len) {
     int i = 0;
@@ -970,10 +1133,11 @@ static void demux_ps(uint8_t *buf, int len) {
             int payload_len = (pes_len > 0) ? pes_len - 3 - pes_header_data_len : len - payload_start;
             if (payload_len < 0) payload_len = 0;
             if (payload_start + payload_len > len) payload_len = len - payload_start;
+            int64_t pes_pts = pes_get_pts(buf + i, len - i);
 
             if (stream_id >= 0xE0 && stream_id <= 0xEF) {
 				if (payload_len > 0) {
-                     video_feed(buf + payload_start, payload_len);
+                     video_feed(buf + payload_start, payload_len, pes_pts);
                 }
             } else if (stream_id == 0xBD) {
                 // Private stream 1 (audio/subtitle)
@@ -995,8 +1159,13 @@ static void demux_ps(uint8_t *buf, int len) {
                 }
                 // Feed AC3 audio
                 if (audio_enabled && audio_type == AUDIO_AC3 && sid == audio_sid_selected) {
-                    if (payload_len > 4)
+                    if (payload_len > 4) {
+                        // first_access_unit_pointer: 1 = frame starts right after the 4-byte header
+                        int fap = (buf[payload_start + 2] << 8) | buf[payload_start + 3];
+                        if (pes_pts != PTS_NONE && fap > 0)
+                            ac3_pts_register(ac3_in_pos + fap - 1, pes_pts);
                         ac3_push(buf + payload_start + 4, payload_len - 4);
+                    }
                 } 
                 // Subtitle: substream 0x20–0x3F
                 else if (sid >= 0x20 && sid <= 0x3F && subtitle_enabled) {
@@ -1020,6 +1189,7 @@ static void demux_ps(uint8_t *buf, int len) {
 							memcpy(s->buf + 2, buf + off + 2, s->collected);
 							s->collected += 2;
 							s->active = 1;
+							s->pts = pes_pts;
 						}
 						// Continuation of SPU packet
 						else {
@@ -1032,9 +1202,13 @@ static void demux_ps(uint8_t *buf, int len) {
 						// Completed SPU packet
 						if (s->active && s->collected >= s->expected) {
 							if (current_sub_sid >= 0 && sid == current_sub_sid) {
+#ifdef SYNC_OLD
 								struct spu_state st;
 								memset(&st, 0, sizeof(st));
 								spu_demux_control(s->buf, s->expected, &st);
+#else
+								spu_queue(s->buf, s->expected, s->pts);
+#endif
 							}
 							s->active = 0;
 						}	
@@ -1092,6 +1266,39 @@ static void redraw(void) {
 
 static uint8_t buf[2048];
 
+#ifdef TEST_PLAIN_VOB
+static int vob_fd = -1;
+static int read_block(uint32_t lba, uint8_t *b) {
+    return pread(vob_fd, b, 2048, (off_t)lba * 2048) == 2048 ? 1 : 0;
+}
+#else
+static int read_block(uint32_t lba, uint8_t *b) {
+    return DVDReadBlocks(vob, lba, 1, b);
+}
+#endif
+
+// Seek or audio stream change: drop queued/decoding audio
+static void audio_stream_reset(void) {
+    audio_flush();
+    ac3_reset();
+    aq_end_pts = PTS_NONE;
+#ifndef SYNC_OLD
+    aq_rd = aq_fill = 0;
+#endif
+}
+
+#ifdef AUDIO_HAVE_SIM
+// test log: frame pts vs. the pts of the audio actually being heard
+static void av_test_log(int64_t pts, int dropped) {
+    int64_t heard = PTS_NONE;
+    if (aq_end_pts != PTS_NONE && audio_get_backend() != AUDIO_BACKEND_NONE)
+        heard = aq_end_pts - (int64_t)(aq_fill + audio_sim_true_delay()) * PTS_HZ / audio_rate;
+    printf("AV %lld %lld %lld %d\n", (long long)now_us(), (long long)pts,
+           heard == PTS_NONE ? -1LL : (long long)heard, dropped);
+}
+#endif
+
+#ifdef SYNC_OLD
 static void playback_step(void) {
 	if (dvd_block >= total_blocks) { running = 0; return; }
 	static const mpeg2_fbuf_t *last_displayed = NULL;
@@ -1112,7 +1319,7 @@ static int pacemaker_initialiseret = 0;
 	}
 	
     if (mpeg2_parse(mpeg2) == STATE_BUFFER) {	// Feed decoder if it needs data
-        if (DVDReadBlocks(vob, dvd_block++, 1, buf) != 1) {
+        if (read_block(dvd_block++, buf) != 1) {
             return;
         }
 		demux_ps(buf, 2048);
@@ -1197,6 +1404,9 @@ sidste_tid = nuvrende_tid;
 			//end
 #endif
 			redraw();
+#ifdef AUDIO_HAVE_SIM
+			av_test_log(PTS_NONE, 0);
+#endif
 			
             if (!audio_active) {
 				usleep(35000); // pace ONLY on video output if no audio  
@@ -1205,11 +1415,362 @@ sidste_tid = nuvrende_tid;
     }
 }
 
+#else /* new A/V timing */
+
+// ---- master clock ----------------------------------------------------------
+// Runs on the system clock (smooth) and is locked to the audio position.
+// Many sound cards report their position only once per period (85 ms with
+// 4096-frame periods), so between updates the reported position lags. The
+// clock therefore follows the upper edge of the reports:
+//  - a report ahead of the clock moves the clock forward to it
+//  - once a second, if every report in that second was behind the clock,
+//    the clock is pulled back by half of the smallest gap
+//  - more than CLOCK_SLACK ahead of the audio (underrun, pause): fall back
+#define CLOCK_SLACK (PTS_HZ / 10)        // 100 ms
+#define CLOCK_JUMP  (PTS_HZ / 5)         // 200 ms: beyond this, re-anchor
+static int64_t clk_pts = PTS_NONE;
+static int64_t clk_us = 0;
+static int64_t audio_ignore_until_us = 0;
+static int64_t clk_win_max = PTS_NONE;   // max (report - clock) this window
+static int64_t clk_win_us = 0;
+static int64_t av_offset = 0;            // MINIDVD_AV_OFFSET (ms) in 90 kHz units
+static int64_t clk_audio_us = 0;         // last time an audio report was used
+
+// is the clock currently following the audio?
+static int clock_on_audio(void) {
+    return clk_audio_us && now_us() - clk_audio_us < 500000;
+}
+
+static int64_t clock_now(void) {
+    if (clk_pts == PTS_NONE) return PTS_NONE;
+    return clk_pts + (now_us() - clk_us) * 9 / 100;
+}
+
+static void clock_set(int64_t pts) {
+    clk_pts = pts;
+    clk_us = now_us();
+}
+
+static void clock_window_reset(void) {
+    clk_win_max = PTS_NONE;
+    clk_win_us = now_us();
+}
+
+// pts of the audio coming out of the speaker right now, if known
+static int audio_clock_sample(int64_t *out) {
+    if (audio_get_backend() == AUDIO_BACKEND_NONE || aq_end_pts == PTS_NONE)
+        return 0;
+    int d = audio_get_delay();
+    if (d < 0) return 0;
+    if (d == 0 && aq_fill == 0) return 0;   // starved: no audio to follow
+    *out = aq_end_pts - (int64_t)(aq_fill + d) * PTS_HZ / audio_rate;
+    return 1;
+}
+
+static void clock_update(void) {
+    int64_t s, est;
+    if (!audio_clock_sample(&s)) return;
+    est = clock_now();
+    if (est == PTS_NONE) { clock_set(s); clock_window_reset(); clk_audio_us = now_us(); return; }
+    if (s - est > CLOCK_JUMP || est - s > CLOCK_JUMP) {
+        if (now_us() < audio_ignore_until_us) return;   // video just re-anchored
+        clock_set(s);
+        clock_window_reset();
+        clk_audio_us = now_us();
+        return;
+    }
+    audio_ignore_until_us = 0;
+    clk_audio_us = now_us();
+    if (s > est) {
+        clock_set(s);                       // audio is further than we thought
+        est = s;
+    } else if (est - s > CLOCK_SLACK) {
+        clock_set(s + CLOCK_SLACK);         // audio stalled (underrun, pause)
+        clock_window_reset();
+        return;
+    }
+    if (clk_win_max == PTS_NONE || s - est > clk_win_max)
+        clk_win_max = s - est;
+    if (now_us() - clk_win_us >= 1000000) {
+        if (clk_win_max != PTS_NONE && clk_win_max < -(PTS_HZ / 500))   // > 2 ms ahead
+            clk_pts += clk_win_max / 2;
+        clock_window_reset();
+    }
+}
+
+// ---- audio output: never blocks ---------------------------------------------
+static void audio_pump(void) {
+    if (audio_get_backend() == AUDIO_BACKEND_NONE) {
+        aq_rd = aq_fill = 0;                // nothing to play it on
+        return;
+    }
+    int budget = audio_get_space();
+    if (budget < 0) budget = 1024;          // unknown: small (possibly blocking) writes
+    while (budget > 0 && aq_fill > 0) {
+        int n = aq_fill;
+        if (n > budget) n = budget;
+        if (n > AQ_FRAMES - aq_rd) n = AQ_FRAMES - aq_rd;
+        if (audio_write(aq_buf + aq_rd * 2, n) < 0) break;
+        aq_rd = (aq_rd + n) % AQ_FRAMES;
+        aq_fill -= n;
+        budget -= n;
+    }
+}
+
+// ---- video -----------------------------------------------------------------
+static int frame_ready = 0;              // a decoded frame is waiting to be shown
+static int64_t frame_pts = PTS_NONE;
+static int64_t frame_dur = PTS_HZ / 25;
+static int64_t vid_next_pts = PTS_NONE;  // predicted pts of the next frame
+static int frame_drops = 0;
+static int frame_discont = 0;            // pts jumped vs. the previous frame
+static int vq_feeding = 0;               // decoder is reading vq slot vq_tail
+static int64_t clock_wait_since_us = 0;
+static int64_t last_step_us = 0;
+static const mpeg2_fbuf_t *last_displayed = NULL;
+
+static int need_more_data(void) {
+    if (dvd_block >= total_blocks) return 0;
+    if (vq_count > VQ_SLOTS - 8) return 0;
+    if (AQ_FRAMES - aq_fill < 8 * 1536) return 0;
+    // don't read far ahead once there is audio queued and video waiting
+    if (aq_fill > audio_rate / 2 && (frame_ready || vq_count > 64)) return 0;
+    // keep the video read-ahead to ~0.7 s, unless we are still short of audio
+    {
+        int64_t now = clock_now();
+        if (now != PTS_NONE && vq_last_pts != PTS_NONE &&
+            vq_last_pts - now > 7 * PTS_HZ / 10 && (frame_ready || vq_count > 16) &&
+            (!audio_active || aq_fill > audio_rate / 4))
+            return 0;
+    }
+    return 1;
+}
+
+// Decode until the next picture is ready for display (kept in libmpeg2's
+// display buffer until shown). Returns 0 if more data is needed.
+static int decode_next_frame(void) {
+    for (;;) {
+        int state = mpeg2_parse(mpeg2);
+        switch (state) {
+        case STATE_BUFFER:
+            if (vq_feeding) {                // previous slot fully consumed
+                vq_tail = (vq_tail + 1) % VQ_SLOTS;
+                vq_count--;
+                vq_feeding = 0;
+            }
+            if (vq_count == 0) return 0;
+            if (vq_pts[vq_tail] != PTS_NONE)
+                mpeg2_tag_picture(mpeg2, (uint32_t)vq_pts[vq_tail],
+                                  (uint32_t)(vq_pts[vq_tail] >> 32));
+            mpeg2_buffer(mpeg2, vq_data[vq_tail], vq_data[vq_tail] + vq_len[vq_tail]);
+            vq_feeding = 1;
+            break;
+        case STATE_SEQUENCE: {
+            int new_w = info->sequence->width;
+            int new_h = info->sequence->height;
+            if (new_w != video_w || new_h != video_h) {
+                video_w = new_w;
+                video_h = new_h;
+                recreate_ximage(video_w, video_h);
+                XResizeWindow(dpy, win, video_w, video_h);
+            }
+            break;
+        }
+        case STATE_SLICE:
+        case STATE_END:
+            if (info->display_fbuf && info->display_picture &&
+                info->display_fbuf != last_displayed) {
+                const mpeg2_picture_t *pic = info->display_picture;
+                last_displayed = info->display_fbuf;
+                if (info->sequence && info->sequence->frame_period)
+                    frame_dur = info->sequence->frame_period / 300;   // 27 MHz -> 90 kHz
+                if (pic->flags & PIC_FLAG_TAGS) {
+                    frame_pts = ((int64_t)pic->tag2 << 32) | pic->tag;
+                    if (vid_next_pts != PTS_NONE &&
+                        (frame_pts - vid_next_pts > PTS_HZ || vid_next_pts - frame_pts > PTS_HZ))
+                        frame_discont = 1;                            // e.g. cell change
+                } else {
+                    frame_pts = vid_next_pts;                         // extrapolate
+                }
+                if (frame_pts != PTS_NONE)
+                    vid_next_pts = frame_pts + frame_dur * pic->nb_fields / 2;
+                frame_ready = 1;
+                return 1;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static void show_frame(int64_t late) {
+    have_frame = 1;
+    video_x = (win_w - video_w) / 2;
+    video_y = (win_h - video_h) / 2;
+#ifdef LOGGING
+    {
+        struct timespec nuvrende_tid;
+        clock_gettime(CLOCK_MONOTONIC, &nuvrende_tid);
+        if (!forste_gennemlob) {
+            long diff_us = (nuvrende_tid.tv_sec - sidste_tid.tv_sec) * 1000000 +
+                           (nuvrende_tid.tv_nsec - sidste_tid.tv_nsec) / 1000;
+            printf("Tid siden sidste redraw: %ld us (late %ld us)\n",
+                   diff_us, (long)(late * 100 / 9));
+        } else {
+            forste_gennemlob = 0;
+        }
+        sidste_tid = nuvrende_tid;
+    }
+#else
+    (void)late;
+#endif
+    redraw();
+}
+
+// Full reset after a seek
+static void av_reset(void) {
+    audio_stream_reset();
+    vq_tail = vq_count = 0;
+    vq_last_pts = PTS_NONE;
+    vq_feeding = 0;
+    frame_discont = 0;
+    mpeg2_reset(mpeg2, 0);
+    frame_ready = 0;
+    vid_next_pts = PTS_NONE;
+    last_displayed = NULL;
+    spu_pending_len = 0;
+    for (int i = 0; i < 0x20; i++) spu[i].active = 0;
+    clk_pts = PTS_NONE;
+    clock_wait_since_us = 0;
+}
+
+// Sleep for (up to) 'us', waking a little early by the amount the system
+// tends to oversleep (learned as we go). The last <= 4 ms are not slept at
+// all: playback_step just loops, so frames go out on time even on kernels
+// with coarse timers.
+static void sleep_us(int64_t us) {
+    static int64_t oversleep = 1000;     // estimate, us
+    int64_t spin = oversleep < 4000 ? oversleep : 4000;
+    if (us <= spin + 500) return;        // close to due: don't sleep
+    us -= oversleep + 500;
+    if (us < 1000) us = 1000;
+    if (us > 10000) us = 10000;          // stay responsive (audio, X events)
+    int64_t t0 = now_us();
+    usleep((useconds_t)us);
+    int64_t over = now_us() - t0 - us;
+    if (over < 0) over = 0;
+    oversleep += (over - oversleep) / 8;
+}
+
+static void playback_step(void) {
+    int busy = 0;
+    int64_t t = now_us();
+
+    if (seek_pending) {
+        seek_pending = 0;
+        dvd_block = seek_target_block;
+        av_reset();
+        return;
+    }
+    // not called for a while (pause, help screen): re-anchor the clock
+    if (last_step_us && t - last_step_us > 300000)
+        clk_pts = PTS_NONE;
+    last_step_us = t;
+
+    audio_pump();
+    clock_update();
+
+    // 1. read ahead
+    for (int n = 0; n < 16 && need_more_data(); n++) {
+        if (read_block(dvd_block++, buf) != 1) continue;
+        demux_ps(buf, 2048);
+        busy = 1;
+    }
+    audio_pump();
+
+    // 2. decode one frame ahead
+    if (!frame_ready && decode_next_frame())
+        busy = 1;
+
+    // 3. subtitles
+    if (spu_pending_len) {
+        int64_t now = clock_now();
+        if (spu_pending_pts == PTS_NONE || now == PTS_NONE || now >= spu_pending_pts ||
+            spu_pending_pts - now > 5 * PTS_HZ) {
+#ifdef AUDIO_HAVE_SIM
+            printf("SPU %lld %lld\n", (long long)spu_pending_pts, (long long)(now == PTS_NONE ? -1 : now));
+#endif
+            spu_show_pending();
+        }
+    }
+
+    // 4. show the frame when its time has come
+    if (frame_ready) {
+        int64_t now = clock_now();
+        if (now == PTS_NONE) {
+            // no clock yet: give the audio up to 1 s to start it, else run from video
+            int audio_coming = audio_enabled && audio_get_backend() != AUDIO_BACKEND_NONE;
+            if (!clock_wait_since_us) clock_wait_since_us = t;
+            if (frame_pts == PTS_NONE || !audio_coming || t - clock_wait_since_us > 1000000) {
+                clock_set(frame_pts == PTS_NONE ? 0 : frame_pts);
+                now = clock_now();
+            }
+        }
+        if (now != PTS_NONE) {
+            int64_t diff;
+            clock_wait_since_us = 0;
+            if (frame_pts == PTS_NONE) frame_pts = now;
+            diff = frame_pts + av_offset - now;
+            if (frame_discont || diff > 2 * PTS_HZ ||
+                (diff < -PTS_HZ && !clock_on_audio())) {
+                // timestamp jump (cell change etc.), or far off with nothing
+                // else to follow: restart the clock from this frame and give
+                // the audio 1.5 s to catch up before following it again
+                clock_set(frame_pts + av_offset);
+                if (frame_discont || diff > 2 * PTS_HZ)
+                    audio_ignore_until_us = t + 1500000;
+                frame_discont = 0;
+                diff = 0;
+            }
+            if (diff <= 0) {
+                // late: drop to catch up, but show at least every 5th frame
+                int drop = -diff > 2 * frame_dur && frame_drops < 4;
+                if (drop) frame_drops++;
+                else { frame_drops = 0; show_frame(-diff); }
+#ifdef AUDIO_HAVE_SIM
+                av_test_log(frame_pts, drop);
+#endif
+                frame_ready = 0;
+                busy = 1;
+            } else if (!busy) {
+                sleep_us(diff * 100 / 9);
+            }
+        } else if (!busy) {
+            sleep_us(5000);
+        }
+    } else if (!busy) {
+        if (dvd_block >= total_blocks && vq_count == 0) {
+            running = 0;                      // end of title
+            return;
+        }
+        sleep_us(5000);
+    }
+}
+#endif /* SYNC_OLD */
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s /dev/dvd\n", argv[0]);
         return 1;
     }
+#ifdef TEST_PLAIN_VOB
+    vob_fd = open(argv[1], O_RDONLY);
+    if (vob_fd < 0) { perror(argv[1]); return 1;}
+    total_blocks = (uint32_t)(lseek(vob_fd, 0, SEEK_END) / 2048);
+    current_sub_sid = sub_sid_list[0];
+    audio_sid_selected = 0x80;
+#else
     dvd_reader_t *dvd = DVDOpen(argv[1]);
     if (!dvd) {return 1;}
 	//find largest VTS
@@ -1247,11 +1808,22 @@ int main(int argc, char **argv) {
     vob = DVDOpenFile(dvd, best_vts, DVD_READ_TITLE_VOBS);
     if (!vob) { return 1;}
     total_blocks = DVDFileSize(vob);  // number of 2048-byte blocks
+#endif
 	fprintf(stderr, "VOB size: %d blocks\n", total_blocks);
 
     dvd_block = 0;
 	mpeg2 = mpeg2_init();
+#ifdef SYNC_OLD
 	mpeg2_tag_picture(mpeg2, 0, 1);
+#else
+	{   // optional A/V fine tuning: + = show video later
+		const char *e = getenv("MINIDVD_AV_OFFSET");
+		if (e) {
+			av_offset = (int64_t)atoi(e) * 90;
+			fprintf(stderr, "A/V offset: %d ms\n", atoi(e));
+		}
+	}
+#endif
 	info = mpeg2_info(mpeg2);
     mpeg2_convert(mpeg2, mpeg2convert_rgb32, NULL);
     
@@ -1271,6 +1843,30 @@ int main(int argc, char **argv) {
     
 	while (running) {
 		if (sigint_received) { running = 0; break; }
+#ifdef TEST_PLAIN_VOB
+		{   // test script: MINIDVD_TEST="sec:seek:frac,sec:audio,sec:pause:secs"
+			static const char *ts = NULL;
+			static int64_t t_start, unpause_at;
+			int64_t el;
+			if (!ts) { ts = getenv("MINIDVD_TEST"); if (!ts) ts = ""; t_start = now_us(); }
+			el = now_us() - t_start;
+			if (unpause_at && el >= unpause_at) { paused = 0; unpause_at = 0; fprintf(stderr, "TEST unpause\n"); }
+			if (*ts && el >= (int64_t)(atof(ts) * 1e6)) {
+				const char *a = strchr(ts, ':');
+				a = a ? a + 1 : "";
+				fprintf(stderr, "TEST %.40s\n", a);
+				if (!strncmp(a, "seek:", 5)) request_seek(atof(a + 5));
+				else if (!strncmp(a, "pause:", 6)) { paused = 1; unpause_at = el + (int64_t)(atof(a + 6) * 1e6); }
+				else if (!strncmp(a, "audio", 5)) {
+					audio_sid_selected = audio_sid_selected == 0x80 ? 0x81 : 0x80;
+					audio_stream_reset();
+					audio_active = 1; audio_bytes = 0; last_audio_bytes = 0;
+				}
+				ts = strchr(ts, ',');
+				ts = ts ? ts + 1 : "";
+			}
+		}
+#endif
 	
 		//Handle X events
         while (XPending(dpy)) {
@@ -1328,9 +1924,7 @@ int main(int argc, char **argv) {
 							}
 						}
 						audio_sid_selected = audio_sid_list[idx];
-						audio_flush();
-						ac3_len = 0;
-						ac3_need = 0;
+						audio_stream_reset();
 						audio_active = 1;      // optimistic
 						audio_bytes = 0;
 						last_audio_bytes = 0;
@@ -1407,16 +2001,25 @@ int main(int argc, char **argv) {
 		}
 		
 		//if silent audio substream:
+#ifdef SYNC_OLD
 		static int audio_check_counter = 0;
 		audio_check_counter++;
 		if (audio_check_counter >= 50) {   // ~1 sec at 50 fps loop
+#else
+		static int64_t audio_check_us = 0;
+		if (!audio_check_us) audio_check_us = now_us();
+		if (now_us() - audio_check_us >= 1000000) {   // once a second
+			audio_check_us = now_us();
+#endif
 			if (audio_bytes == last_audio_bytes) {
 				audio_active = 0;
 			} else {
 				audio_active = 1;
 			}
 			last_audio_bytes = audio_bytes;
+#ifdef SYNC_OLD
 			audio_check_counter = 0;
+#endif
 		}
 	} //while running
 
@@ -1428,8 +2031,12 @@ int main(int argc, char **argv) {
 	XCloseDisplay(dpy);
 	audio_close();
 	a52_free(a52);
+#ifdef TEST_PLAIN_VOB
+    close(vob_fd);
+#else
     DVDCloseFile(vob);
     ifoClose(ifo);
     DVDClose(dvd);
+#endif
     return 0;
 }

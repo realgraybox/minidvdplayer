@@ -31,3 +31,4 @@ stamp-h1
 /libmpeg2-0.5.1/include/config.h
 /a52dec-0.8.0/**/Makefile
 /a52dec-0.8.0/include/config.h
+/tests/out/
