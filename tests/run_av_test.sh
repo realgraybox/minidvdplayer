@@ -5,7 +5,7 @@
 # that reports its position once per 4096-frame period, like many real
 # cards), plays a generated 30 s PAL DVD-style VOB under Xvfb, and prints
 # frame-interval and A/V-offset statistics. Needs ffmpeg, Xvfb (xvfb-run)
-# and python3.
+# and python3. The VOB uses a DVD-like IBBPBBP... GOP (B-frames matter).
 #
 #   tests/run_av_test.sh          new timing
 #   tests/run_av_test.sh old      previous timing (SYNC=old)
@@ -21,7 +21,7 @@ mkdir -p $OUT
 if [ ! -f $OUT/test.vob ]; then
 	ffmpeg -loglevel error -y -f lavfi -i testsrc2=size=720x576:rate=25 \
 		-f lavfi -i "sine=frequency=440:sample_rate=48000" -t 30 \
-		-target pal-dvd -b:v 5000k -c:a ac3 -b:a 192k -ac 2 $OUT/test.vob
+		-target pal-dvd -bf 2 -g 12 -b:v 5000k -c:a ac3 -b:a 192k -ac 2 $OUT/test.vob
 fi
 
 make clean >/dev/null

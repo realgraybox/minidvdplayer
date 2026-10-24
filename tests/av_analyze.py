@@ -1,6 +1,6 @@
 import sys, statistics as st
 def load(fn, first_pts=48600):
-    rows=[l.split() for l in open(fn) if l.startswith('AV ')]
+    rows=[l.split() for l in open(fn) if l.startswith('AV ') and len(l.split())==5]
     out=[]
     for i,r in enumerate(rows):
         t,pts,heard,drop=int(r[1]),int(r[2]),int(r[3]),int(r[4])
