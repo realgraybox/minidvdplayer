@@ -1437,7 +1437,8 @@ static void demux_ps(uint8_t *buf, int len) {
 // ------------------ DVD ------------------
 
 static void redraw(void) {
-    if (!have_frame || !ximg) {return;}
+    // display_fbuf is NULL right after a new sequence (old buffers freed)
+    if (!have_frame || !ximg || !info->display_fbuf) {return;}
     
     // decide destination size
     dst_w = scale_video ? win_w : video_w;
@@ -1506,6 +1507,29 @@ static void redraw(void) {
 
 static uint8_t buf[2048];
 
+// New sequence header. libmpeg2 restarts its decoder (and switches the RGB
+// conversion off) when the picture size/format changes or after a sequence
+// end code, so the conversion must be set up again every time, as in
+// libmpeg2's own sample player. Without it frames come out as raw YUV,
+// which shows as a 4x4 grid of small pictures and reads past the buffer.
+static int rgb_ok = 0;                    // display buffers are RGB32
+
+static void new_sequence(void) {
+    int new_w = info->sequence->width;
+    int new_h = info->sequence->height;
+    rgb_ok = mpeg2_convert(mpeg2, mpeg2convert_rgb32, NULL) == 0;
+    if (!rgb_ok)
+        fprintf(stderr, "Video: unsupported picture format %dx%d (no RGB conversion)\n",
+                new_w, new_h);
+    if (new_w != video_w || new_h != video_h) {
+        fprintf(stderr, "Video: %dx%d\n", new_w, new_h);
+        video_w = new_w;
+        video_h = new_h;
+        recreate_ximage(video_w, video_h);
+        XResizeWindow(dpy, win, video_w, video_h);
+    }
+}
+
 #ifdef TEST_PLAIN_VOB
 static int vob_fd = -1;
 static int read_block(uint32_t lba, uint8_t *b) {
@@ -1566,21 +1590,14 @@ static void playback_step(void) {
 	int state;
 	while ((state = mpeg2_parse(mpeg2)) != STATE_BUFFER) { // Drain decoder until it blocks again
 		if (state == STATE_SEQUENCE) {
-			int new_w = info->sequence->width;
-			int new_h = info->sequence->height;
-			if (new_w != video_w || new_h != video_h) {
-				video_w = new_w;
-				video_h = new_h;
-				recreate_ximage(video_w, video_h);
-				XResizeWindow(dpy, win, video_w, video_h);
-			}
+			new_sequence();
 		}
 		
 		// libmpeg2 returns STATE_SLICE/STATE_END once per finished picture.
 		// Don't compare display_fbuf with the previous one: every B-frame is
 		// decoded into the same buffer, so that would skip every second B-frame.
-		if ((state == STATE_SLICE || state == STATE_END) &&	info->display_fbuf &&
-			info->display_picture) {
+		if ((state == STATE_SLICE || state == STATE_END || state == STATE_INVALID_END) &&
+			info->display_fbuf && info->display_picture && rgb_ok) {
 			
 			have_frame = 1;
 
@@ -1797,23 +1814,16 @@ static int decode_next_frame(void) {
             mpeg2_buffer(mpeg2, vq_data[vq_tail], vq_data[vq_tail] + vq_len[vq_tail]);
             vq_feeding = 1;
             break;
-        case STATE_SEQUENCE: {
-            int new_w = info->sequence->width;
-            int new_h = info->sequence->height;
-            if (new_w != video_w || new_h != video_h) {
-                video_w = new_w;
-                video_h = new_h;
-                recreate_ximage(video_w, video_h);
-                XResizeWindow(dpy, win, video_w, video_h);
-            }
+        case STATE_SEQUENCE:
+            new_sequence();
             break;
-        }
         case STATE_SLICE:
         case STATE_END:
+        case STATE_INVALID_END:               // last picture before a new sequence
             // one finished picture per STATE_SLICE/STATE_END; B-frames all
             // share one buffer, so display_fbuf must not be used to detect
             // "new picture" (that skipped every second B-frame)
-            if (info->display_fbuf && info->display_picture) {
+            if (info->display_fbuf && info->display_picture && rgb_ok) {
                 const mpeg2_picture_t *pic = info->display_picture;
                 if (info->sequence && info->sequence->frame_period)
                     frame_dur = info->sequence->frame_period / 300;   // 27 MHz -> 90 kHz
@@ -2157,8 +2167,7 @@ int main(int argc, char **argv) {
 		}
 	}
 #endif
-	info = mpeg2_info(mpeg2);
-    mpeg2_convert(mpeg2, mpeg2convert_rgb32, NULL);
+	info = mpeg2_info(mpeg2);   // RGB conversion: set up per sequence (new_sequence)
     
     a52 = a52_init(0);
 	if (!a52) { fprintf(stderr, "a52_init failed\n"); exit(1); }
