@@ -129,7 +129,7 @@ X11_LIBS ?= $(shell pkg-config $(if $(STATIC),--static) --libs xrender xext x11 
 LDFLAGS = $(STATIC) -Wl,--gc-sections,--sort-common,-s
 LDLIBS  = $(LIB_ARCHIVES) $(X11_LIBS) -lm
 
-.PHONY: all libs clean libs-clean distclean install FORCE
+.PHONY: all libs clean libs-clean distclean install test-ifo FORCE
 
 all: $(TARGET)
 
@@ -192,12 +192,18 @@ $(A52_A): $(A52_DIR)/$(LIB_STAMP) FORCE
 
 # ---------------------------------------------------------------------------
 
+# unit test: title map (cells/chapters) built from in-memory IFO tables
+test-ifo: $(LIB_ARCHIVES)
+	$(CC) $(CFLAGS) -Wno-pointer-sign -o tests/ifo_map_test tests/ifo_map_test.c \
+		audio/audio.c audio/pcm.c $(LDLIBS)
+	./tests/ifo_map_test
+
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/
 
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) $(OBJS) tests/ifo_map_test
 
 libs-clean:
 	for d in $(DVDCSS_DIR) $(DVDREAD_DIR) $(MPEG2_DIR) $(A52_DIR); do \

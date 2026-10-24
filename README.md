@@ -50,12 +50,22 @@ scales on the CPU. Building needs libXext and libXrender.
 ## Usage
 
 Usage: minidvd /dev/your-dvd-drive or minidvd /dev/your-mounted-dvd-iso-path.
+
+minidvd plays the main title: the longest program chain of the largest title
+set, cell by cell, so logos and extras outside the film are skipped. Its
+chapters and cell times are used for the jump keys below. If the disc has no
+usable program chain, the whole title set is played and jumps are estimated
+from the bitrate.
+
 Keys:
 Space: Pause
 m: Mute
 + / -: Volume up / down
 0: Volume reset
-Mouse click: Seek within title
+Left / Right: Back / forward 10 s
+Down / Up: Back / forward 1 min
+Shift + Left / Right: Previous / next chapter
+Mouse click: Seek within title (by time)
 a: Next audio stream
 Shift + a: Previous audio stream
 f: Fullscreen

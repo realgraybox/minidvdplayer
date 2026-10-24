@@ -32,3 +32,4 @@ stamp-h1
 /a52dec-0.8.0/**/Makefile
 /a52dec-0.8.0/include/config.h
 /tests/out/
+/tests/ifo_map_test
