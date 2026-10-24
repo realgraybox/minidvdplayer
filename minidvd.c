@@ -18,6 +18,9 @@
 #include <X11/keysym.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xrender.h>
+#ifndef RepeatPad
+#define RepeatPad 2    // RENDER 0.10+; missing from older headers (XFree86 4.x)
+#endif
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
@@ -202,6 +205,7 @@ static void recreate_ximage(int w, int h);
 // supports it). Without RENDER, or with MINIDVD_NORENDER=1, minidvd scales
 // on the CPU and uploads the full window-sized image.
 static int use_render = 0;
+static int render_pad = 0;         // server supports RepeatPad (RENDER >= 0.10)
 static XRenderPictFormat *render_fmt;
 static Picture render_dst = None;  // the window
 static Picture render_src = None;  // the video pixmap
@@ -1039,6 +1043,9 @@ static void x11_init(int w, int h) {
         int ev, er;
         if (!getenv("MINIDVD_NORENDER") && XRenderQueryExtension(dpy, &ev, &er) &&
             (render_fmt = XRenderFindVisualFormat(dpy, DefaultVisual(dpy, s))) != NULL) {
+            int maj = 0, min = 0;
+            XRenderQueryVersion(dpy, &maj, &min);
+            render_pad = maj > 0 || min >= 10;
             render_dst = XRenderCreatePicture(dpy, win, render_fmt, 0, NULL);
             use_render = 1;
             fprintf(stderr, "Video: XRender scaling\n");
@@ -1056,7 +1063,9 @@ static void render_ensure_pixmap(int w, int h) {
     if (render_src) XRenderFreePicture(dpy, render_src);
     if (render_pix) XFreePixmap(dpy, render_pix);
     render_pix = XCreatePixmap(dpy, win, w, h, DefaultDepth(dpy, DefaultScreen(dpy)));
-    pa.repeat = RepeatPad;                // bilinear edges: repeat border pixels
+    // bilinear edges: repeat border pixels (older servers: no padding,
+    // the outermost pixels just blend towards black)
+    pa.repeat = render_pad ? RepeatPad : RepeatNone;
     render_src = XRenderCreatePicture(dpy, render_pix, render_fmt, CPRepeat, &pa);
     render_pix_w = w;
     render_pix_h = h;
