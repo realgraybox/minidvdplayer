@@ -1316,7 +1316,6 @@ static void av_test_log(int64_t pts, int dropped) {
 #ifdef SYNC_OLD
 static void playback_step(void) {
 	if (dvd_block >= total_blocks) { running = 0; return; }
-	static const mpeg2_fbuf_t *last_displayed = NULL;
 	//framelog
 #ifdef LOGGING
 	static struct timespec pacemaker_tid;
@@ -1329,7 +1328,6 @@ static int pacemaker_initialiseret = 0;
 		seek_pending = 0;
 		dvd_block = seek_target_block;
 		audio_flush();	// Flush audio device buffer (optional but good)
-		last_displayed = NULL;
 		return; // refill pipeline cleanly
 	}
 	
@@ -1357,10 +1355,12 @@ static int pacemaker_initialiseret = 0;
 			}
 		}
 		
+		// libmpeg2 returns STATE_SLICE/STATE_END once per finished picture.
+		// Don't compare display_fbuf with the previous one: every B-frame is
+		// decoded into the same buffer, so that would skip every second B-frame.
 		if ((state == STATE_SLICE || state == STATE_END) &&	info->display_fbuf &&
-			info->display_picture && info->display_fbuf != last_displayed) {
+			info->display_picture) {
 			
-			last_displayed = info->display_fbuf;
 			have_frame = 1;
 
 			// center video in window
@@ -1562,7 +1562,6 @@ static int frame_discont = 0;            // pts jumped vs. the previous frame
 static int vq_feeding = 0;               // decoder is reading vq slot vq_tail
 static int64_t clock_wait_since_us = 0;
 static int64_t last_step_us = 0;
-static const mpeg2_fbuf_t *last_displayed = NULL;
 
 static int need_more_data(void) {
     if (dvd_block >= total_blocks) return 0;
@@ -1613,10 +1612,11 @@ static int decode_next_frame(void) {
         }
         case STATE_SLICE:
         case STATE_END:
-            if (info->display_fbuf && info->display_picture &&
-                info->display_fbuf != last_displayed) {
+            // one finished picture per STATE_SLICE/STATE_END; B-frames all
+            // share one buffer, so display_fbuf must not be used to detect
+            // "new picture" (that skipped every second B-frame)
+            if (info->display_fbuf && info->display_picture) {
                 const mpeg2_picture_t *pic = info->display_picture;
-                last_displayed = info->display_fbuf;
                 if (info->sequence && info->sequence->frame_period)
                     frame_dur = info->sequence->frame_period / 300;   // 27 MHz -> 90 kHz
                 if (pic->flags & PIC_FLAG_TAGS) {
@@ -1743,7 +1743,6 @@ static void av_reset(void) {
     mpeg2_reset(mpeg2, 0);
     frame_ready = 0;
     vid_next_pts = PTS_NONE;
-    last_displayed = NULL;
     spu_pending_len = 0;
     for (int i = 0; i < 0x20; i++) spu[i].active = 0;
     clk_pts = PTS_NONE;
