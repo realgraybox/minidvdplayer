@@ -50,6 +50,20 @@ static int forste_gennemlob = 1;
 //end
 #endif
 
+// Diagnostics (new timing): MINIDVD_DEBUG=1 prints a summary on exit,
+// MINIDVD_DEBUG=2 also one line per frame. MINIDVD_XSYNC=1 waits for the X
+// server to finish each frame (XSync instead of XFlush).
+static struct {
+    int level, xsync;
+    long frames, drops, slow_draws, slow_reads, blocks;
+    double iv_sum, iv_sq, late_sum, late_max, draw_sum, draw_max;
+    double dec_sum, dec_max, rd_max, rd_frame_max, dec_frame;
+    long hist[9];                 // shown-frame interval buckets
+    long clk_fwd, clk_back, clk_stall, clk_jump, clk_discont, starved;
+    double clk_fwd_sum, clk_fwd_max, clk_back_sum, clk_stall_sum, clk_adj;
+    int adly_min, adly_max;
+} dbg = { .adly_min = 1 << 30, .adly_max = -1 };
+
 static volatile sig_atomic_t sigint_received = 0;
 static void on_sigint(int s) { (void)s; sigint_received = 1; }
 static void audio_feed(uint8_t *data, int len, void *opaque);
@@ -1261,7 +1275,8 @@ static void redraw(void) {
 
     XPutImage(dpy, win, gc, ximg, 0, 0, dx, dy, dst_w, dst_h);
     if (show_help) draw_help_overlay();
-    XFlush(dpy);
+    if (dbg.xsync) XSync(dpy, False);
+    else XFlush(dpy);
 }
 
 static uint8_t buf[2048];
@@ -1462,7 +1477,10 @@ static int audio_clock_sample(int64_t *out) {
         return 0;
     int d = audio_get_delay();
     if (d < 0) return 0;
-    if (d == 0 && aq_fill == 0) return 0;   // starved: no audio to follow
+    if (d == 0 && aq_fill == 0) {           // starved: no audio to follow
+        if (aq_end_pts != PTS_NONE) dbg.starved++;
+        return 0;
+    }
     *out = aq_end_pts - (int64_t)(aq_fill + d) * PTS_HZ / audio_rate;
     return 1;
 }
@@ -1474,6 +1492,7 @@ static void clock_update(void) {
     if (est == PTS_NONE) { clock_set(s); clock_window_reset(); clk_audio_us = now_us(); return; }
     if (s - est > CLOCK_JUMP || est - s > CLOCK_JUMP) {
         if (now_us() < audio_ignore_until_us) return;   // video just re-anchored
+        dbg.clk_jump++; dbg.clk_adj += (s - est) / 90.0;
         clock_set(s);
         clock_window_reset();
         clk_audio_us = now_us();
@@ -1481,10 +1500,23 @@ static void clock_update(void) {
     }
     audio_ignore_until_us = 0;
     clk_audio_us = now_us();
+    {
+        int d = audio_get_delay();
+        if (d < dbg.adly_min) dbg.adly_min = d;
+        if (d > dbg.adly_max) dbg.adly_max = d;
+    }
     if (s > est) {
+        double ms = (s - est) / 90.0;
+        if (ms > 2.0) {
+            dbg.clk_fwd++; dbg.clk_fwd_sum += ms;
+            if (ms > dbg.clk_fwd_max) dbg.clk_fwd_max = ms;
+        }
+        dbg.clk_adj += ms;
         clock_set(s);                       // audio is further than we thought
         est = s;
     } else if (est - s > CLOCK_SLACK) {
+        dbg.clk_stall++; dbg.clk_stall_sum += (est - s - CLOCK_SLACK) / 90.0;
+        dbg.clk_adj -= (est - s - CLOCK_SLACK) / 90.0;
         clock_set(s + CLOCK_SLACK);         // audio stalled (underrun, pause)
         clock_window_reset();
         return;
@@ -1492,8 +1524,11 @@ static void clock_update(void) {
     if (clk_win_max == PTS_NONE || s - est > clk_win_max)
         clk_win_max = s - est;
     if (now_us() - clk_win_us >= 1000000) {
-        if (clk_win_max != PTS_NONE && clk_win_max < -(PTS_HZ / 500))   // > 2 ms ahead
+        if (clk_win_max != PTS_NONE && clk_win_max < -(PTS_HZ / 500)) { // > 2 ms ahead
             clk_pts += clk_win_max / 2;
+            dbg.clk_back++; dbg.clk_back_sum += -clk_win_max / 180.0;
+            dbg.clk_adj += clk_win_max / 180.0;
+        }
         clock_window_reset();
     }
 }
@@ -1625,7 +1660,77 @@ static void show_frame(int64_t late) {
 #else
     (void)late;
 #endif
-    redraw();
+    {
+        static int64_t prev_end = 0;
+        int64_t t0 = now_us(), t1;
+        double draw, iv;
+        redraw();
+        t1 = now_us();
+        draw = (t1 - t0) / 1000.0;
+        iv = prev_end ? (t1 - prev_end) / 1000.0 : 40.0;
+        prev_end = t1;
+        if (dbg.level) {
+            static const double edge[8] = { 30, 35, 38, 42, 45, 50, 70, 100 };
+            int b = 0;
+            while (b < 8 && iv >= edge[b]) b++;
+            dbg.frames++;
+            if (dbg.frames > 25) {          // skip start-up
+                dbg.hist[b]++;
+                dbg.iv_sum += iv; dbg.iv_sq += iv * iv;
+            }
+            dbg.late_sum += late / 90.0;
+            if (late / 90.0 > dbg.late_max) dbg.late_max = late / 90.0;
+            dbg.draw_sum += draw;
+            if (draw > dbg.draw_max) dbg.draw_max = draw;
+            if (draw > 10.0) dbg.slow_draws++;
+            if (dbg.level > 1)
+                fprintf(stderr, "DBG iv=%5.1f late=%5.1f draw=%5.1f dec=%5.1f rdmax=%5.1f "
+                        "adly=%5d aq=%5d clk=%+6.1f\n", iv, late / 90.0, draw,
+                        dbg.dec_frame, dbg.rd_frame_max, audio_get_delay(), aq_fill, dbg.clk_adj);
+            dbg.dec_frame = 0; dbg.rd_frame_max = 0; dbg.clk_adj = 0;
+        }
+    }
+}
+
+static void dbg_summary(void) {
+    static const char *lbl[9] = { "<30", "30-35", "35-38", "38-42", "42-45",
+                                  "45-50", "50-70", "70-100", ">100" };
+    long n = 0;
+    double mean = 0, sd = 0;
+    if (!dbg.level || !dbg.frames) return;
+    for (int i = 0; i < 9; i++) n += dbg.hist[i];
+    if (n) {
+        mean = dbg.iv_sum / n;
+        sd = dbg.iv_sq / n - mean * mean;
+        sd = sd > 0 ? __builtin_sqrt(sd) : 0;
+    }
+    fprintf(stderr, "\n==== minidvd timing summary ====\n");
+    fprintf(stderr, "audio backend: %s   xsync: %s\n",
+            audio_get_backend() == AUDIO_BACKEND_TINYALSA ? "tinyalsa" :
+            audio_get_backend() == AUDIO_BACKEND_OSS ? "OSS" :
+            audio_get_backend() == AUDIO_BACKEND_NONE ? "none" : "simulated",
+            dbg.xsync ? "on" : "off");
+    fprintf(stderr, "frames shown %ld, dropped %ld\n", dbg.frames, dbg.drops);
+    fprintf(stderr, "interval after draw (ms): mean %.1f sd %.1f\n", mean, sd);
+    fprintf(stderr, "  ");
+    for (int i = 0; i < 9; i++) fprintf(stderr, "%s:%ld ", lbl[i], dbg.hist[i]);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "late at show (ms): avg %.1f max %.1f\n",
+            dbg.late_sum / dbg.frames, dbg.late_max);
+    fprintf(stderr, "draw (ms): avg %.1f max %.1f, >10ms: %ld\n",
+            dbg.draw_sum / dbg.frames, dbg.draw_max, dbg.slow_draws);
+    fprintf(stderr, "decode per frame (ms): avg %.1f max %.1f\n",
+            dbg.dec_sum / dbg.frames, dbg.dec_max);
+    fprintf(stderr, "disc reads: %ld blocks, slowest %.1f ms, >20ms: %ld\n",
+            dbg.blocks, dbg.rd_max, dbg.slow_reads);
+    fprintf(stderr, "audio delay reported (frames): min %d max %d, starved %ld\n",
+            dbg.adly_max < 0 ? -1 : dbg.adly_min, dbg.adly_max, dbg.starved);
+    fprintf(stderr, "clock: forward >2ms %ld (avg %.1f, max %.1f ms), pulled back %ld (avg %.1f ms)\n",
+            dbg.clk_fwd, dbg.clk_fwd ? dbg.clk_fwd_sum / dbg.clk_fwd : 0, dbg.clk_fwd_max,
+            dbg.clk_back, dbg.clk_back ? dbg.clk_back_sum / dbg.clk_back : 0);
+    fprintf(stderr, "clock: audio stalls %ld (%.0f ms total), re-anchored to audio %ld, pts jumps %ld\n",
+            dbg.clk_stall, dbg.clk_stall_sum, dbg.clk_jump, dbg.clk_discont);
+    fprintf(stderr, "================================\n");
 }
 
 // Full reset after a seek
@@ -1683,14 +1788,33 @@ static void playback_step(void) {
 
     // 1. read ahead
     for (int n = 0; n < 16 && need_more_data(); n++) {
-        if (read_block(dvd_block++, buf) != 1) continue;
+        int64_t r0 = now_us();
+        int ok = read_block(dvd_block++, buf);
+        if (dbg.level) {
+            double ms = (now_us() - r0) / 1000.0;
+            dbg.blocks++;
+            if (ms > dbg.rd_max) dbg.rd_max = ms;
+            if (ms > dbg.rd_frame_max) dbg.rd_frame_max = ms;
+            if (ms > 20.0) dbg.slow_reads++;
+        }
+        if (ok != 1) continue;
         demux_ps(buf, 2048);
         busy = 1;
     }
     audio_pump();
 
     // 2. decode one frame ahead
-    if (!frame_ready && decode_next_frame())
+    if (!frame_ready && dbg.level) {
+        int64_t d0 = now_us();
+        int got = decode_next_frame();
+        double ms = (now_us() - d0) / 1000.0;
+        dbg.dec_frame += ms;
+        if (got) {
+            dbg.dec_sum += dbg.dec_frame;
+            if (dbg.dec_frame > dbg.dec_max) dbg.dec_max = dbg.dec_frame;
+            busy = 1;
+        }
+    } else if (!frame_ready && decode_next_frame())
         busy = 1;
 
     // 3. subtitles
@@ -1730,13 +1854,14 @@ static void playback_step(void) {
                 clock_set(frame_pts + av_offset);
                 if (frame_discont || diff > 2 * PTS_HZ)
                     audio_ignore_until_us = t + 1500000;
+                dbg.clk_discont++;
                 frame_discont = 0;
                 diff = 0;
             }
             if (diff <= 0) {
                 // late: drop to catch up, but show at least every 5th frame
                 int drop = -diff > 2 * frame_dur && frame_drops < 4;
-                if (drop) frame_drops++;
+                if (drop) { frame_drops++; dbg.drops++; }
                 else { frame_drops = 0; show_frame(-diff); }
 #ifdef AUDIO_HAVE_SIM
                 av_test_log(frame_pts, drop);
@@ -1817,6 +1942,10 @@ int main(int argc, char **argv) {
 	mpeg2_tag_picture(mpeg2, 0, 1);
 #else
 	{   // optional A/V fine tuning: + = show video later
+		const char *dl = getenv("MINIDVD_DEBUG");
+		const char *xs = getenv("MINIDVD_XSYNC");
+		if (dl) dbg.level = atoi(dl) > 0 ? atoi(dl) : 1;
+		if (xs) dbg.xsync = atoi(xs) > 0;
 		const char *e = getenv("MINIDVD_AV_OFFSET");
 		if (e) {
 			av_offset = (int64_t)atoi(e) * 90;
@@ -2023,6 +2152,9 @@ int main(int argc, char **argv) {
 		}
 	} //while running
 
+#ifndef SYNC_OLD
+	dbg_summary();
+#endif
 	if (ximg) {
 		XDestroyImage(ximg);
 	}

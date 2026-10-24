@@ -33,6 +33,12 @@ If lipsync on a particular sound card needs fine tuning, set
 
 See `tests/` for the timing test that runs without a DVD drive or sound card.
 
+Timing diagnostics (new timing only):
+
+    MINIDVD_DEBUG=1 minidvd /dev/dvd    # summary on exit (q)
+    MINIDVD_DEBUG=2 minidvd /dev/dvd    # also one line per frame
+    MINIDVD_XSYNC=1 minidvd /dev/dvd    # wait for the X server after every frame
+
 ## Usage
 
 Usage: minidvd /dev/your-dvd-drive or minidvd /dev/your-mounted-dvd-iso-path.
