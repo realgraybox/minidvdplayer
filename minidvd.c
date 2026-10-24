@@ -18,8 +18,29 @@
 #include <X11/keysym.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xrender.h>
+// Fallbacks for old RENDER headers (XFree86 4.x). These are protocol
+// values, so they are the same for every server; whether the server
+// accepts RepeatPad is checked at runtime (render_pad).
+#ifndef RepeatNone
+#define RepeatNone 0   // RENDER < 0.10 headers: repeat was just False/True
+#endif
 #ifndef RepeatPad
-#define RepeatPad 2    // RENDER 0.10+; missing from older headers (XFree86 4.x)
+#define RepeatPad 2    // RENDER 0.10+
+#endif
+#ifndef PictOpSrc
+#define PictOpSrc 1
+#endif
+#ifndef CPRepeat
+#define CPRepeat (1 << 0)
+#endif
+#ifndef FilterNearest
+#define FilterNearest "nearest"
+#endif
+#ifndef FilterBilinear
+#define FilterBilinear "bilinear"
+#endif
+#ifndef XDoubleToFixed
+#define XDoubleToFixed(f) ((XFixed) ((f) * 65536))
 #endif
 #include <sys/ipc.h>
 #include <sys/shm.h>
