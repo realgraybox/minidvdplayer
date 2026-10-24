@@ -780,6 +780,9 @@ static const struct help_entry help_entries[] = {
     { "m",           "Mute" },
     { "+ / -",       "Volume up / down" },
     { "0",           "Volume reset" },
+    { "Left/Right",  "Back / forward 10 s" },
+    { "Down/Up",     "Back / forward 1 min" },
+    { "Shift+L/R",   "Previous / next chapter" },
     { "Mouse click", "Seek within title" },
     { "a",           "Next audio stream" },
     { "Shift + a",   "Previous audio stream" },    
@@ -822,20 +825,6 @@ static void print_help(FILE *out) {
     }
 }
 
-static void request_seek(double frac) {
-    if (frac < 0.0) frac = 0.0;
-    if (frac > 1.0) frac = 1.0;
-
-    seek_target_block = (uint32_t)(frac * (double)total_blocks);
-    if (seek_target_block < 0) seek_target_block = 0;
-	if (seek_target_block >= total_blocks)
-    seek_target_block = total_blocks - 1;
-
-    seek_pending = 1;
-
-    fprintf(stderr, "Seek request: %.2f → block %u\n",
-            frac, seek_target_block);
-}
 
 //Toggle fullscreen
 static void toggle_fullscreen(Display *dpy, Window win) {
@@ -866,6 +855,314 @@ static __attribute__((unused)) int64_t now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+// ------------------ title map: main program chain ------------------
+// The DVD's main title is the longest program chain (PGC) in the title set.
+// Its cells give, in playback order, the disc sectors and the playing time
+// of each piece of the film; its programs are the chapters. minidvd plays
+// those cells in order (skipping logos/extras that are not part of the
+// film) and uses them to convert between playing time and disc position.
+// Without an IFO (or a broken one) the whole VOB is played as one piece
+// and time is estimated from the measured bitrate.
+static int read_block(uint32_t lba, uint8_t *b);
+#define MAX_TCELLS 1024
+typedef struct {
+    uint32_t first, last;                 // sectors (inclusive)
+    double start, dur;                    // seconds from title start
+} tcell_t;
+static tcell_t tcells[MAX_TCELLS];
+static int ntcells = 0;                   // 0 = no map: linear over the VOB
+static double tchap[256];                 // chapter start times
+static int ntchap = 0;
+static double title_len = 0;              // seconds (map) or estimate (linear)
+static int cur_cell = 0;                  // cell being read
+static int title_done = 0;                // past the last cell
+static double linear_bps = 400.0;         // blocks/s estimate (linear mode)
+
+// position of the picture on screen, as a disc block
+static uint32_t disp_block = 0;
+
+static double seek_target_time = 0;       // last requested target (held keys add up)
+static int seek_target_cell = 0;
+
+// on-screen position text
+static char osd_text[96];
+static int64_t osd_until_us = 0;
+
+static __attribute__((unused)) double dvdtime_sec(const dvd_time_t *t) {
+#define BCD(x) ((((x) >> 4) & 0x0F) * 10 + ((x) & 0x0F))
+    double fps = ((t->frame_u >> 6) == 3) ? 30000.0 / 1001.0 : 25.0;
+    return BCD(t->hour) * 3600.0 + BCD(t->minute) * 60.0 + BCD(t->second) +
+           BCD(t->frame_u & 0x3F) / fps;
+#undef BCD
+}
+
+static void title_add_cell(uint32_t first, uint32_t last, double dur) {
+    if (ntcells >= MAX_TCELLS) return;
+    tcells[ntcells].first = first;
+    tcells[ntcells].last = last;
+    tcells[ntcells].start = title_len;
+    tcells[ntcells].dur = dur;
+    title_len += dur;
+    ntcells++;
+}
+
+static void title_map_reset(void) {
+    ntcells = ntchap = 0;
+    title_len = 0;
+}
+
+#ifndef TEST_PLAIN_VOB
+// Build the map from the title set's longest program chain. 0 = unusable.
+static int title_map_from_ifo(ifo_handle_t *ifo) {
+    pgcit_t *pgcit = ifo ? ifo->vts_pgcit : NULL;
+    pgc_t *best = NULL;
+    double best_len = 0;
+    int best_i = -1;
+    int cellidx[256];                     // PGC cell number -> our index
+
+    if (!pgcit) return 0;
+    for (int i = 0; i < pgcit->nr_of_pgci_srp; i++) {
+        pgc_t *pgc = pgcit->pgci_srp[i].pgc;
+        double len;
+        if (!pgc || !pgc->nr_of_cells || !pgc->cell_playback) continue;
+        len = dvdtime_sec(&pgc->playback_time);
+        if (len > best_len) { best_len = len; best = pgc; best_i = i; }
+    }
+    if (!best) return 0;
+
+    title_map_reset();
+    for (int c = 0; c < best->nr_of_cells; c++) {
+        cell_playback_t *cp = &best->cell_playback[c];
+        cellidx[c] = ntcells;             // a skipped cell maps to the next one
+        // multi-angle block: only the first angle belongs to the timeline
+        if (cp->block_type == BLOCK_TYPE_ANGLE_BLOCK &&
+            cp->block_mode != BLOCK_MODE_FIRST_CELL)
+            continue;
+        if (cp->first_sector > cp->last_sector || cp->last_sector >= total_blocks)
+            continue;                     // broken entry (e.g. copy protection)
+        title_add_cell(cp->first_sector, cp->last_sector,
+                       dvdtime_sec(&cp->playback_time));
+    }
+    if (!ntcells || title_len < 1.0) { title_map_reset(); return 0; }
+
+    for (int p = 0; p < best->nr_of_programs && ntchap < 256; p++) {
+        int c = best->program_map ? best->program_map[p] - 1 : -1;
+        if (c < 0 || c >= best->nr_of_cells || cellidx[c] >= ntcells) continue;
+        if (ntchap && tcells[cellidx[c]].start <= tchap[ntchap - 1]) continue;
+        tchap[ntchap++] = tcells[cellidx[c]].start;
+    }
+    fprintf(stderr, "Title: PGC %d, %d:%02d:%02d, %d chapters, %d cells\n",
+            best_i + 1, (int)title_len / 3600, ((int)title_len / 60) % 60,
+            (int)title_len % 60, ntchap, ntcells);
+    return 1;
+}
+#endif
+
+#ifdef TEST_PLAIN_VOB
+// Test hook: MINIDVD_TEST_CELLS="first-last:secs,first-last:secs,..."
+// (one chapter per cell).
+static void title_map_from_string(const char *s) {
+    title_map_reset();
+    while (s && *s) {
+        unsigned long a, b;
+        double d;
+        if (sscanf(s, "%lu-%lu:%lf", &a, &b, &d) == 3 && a <= b && b < total_blocks) {
+            if (ntchap < 256) tchap[ntchap++] = title_len;
+            title_add_cell((uint32_t)a, (uint32_t)b, d);
+        }
+        s = strchr(s, ',');
+        if (s) s++;
+    }
+    fprintf(stderr, "Title: test map, %.1f s, %d chapters, %d cells\n",
+            title_len, ntchap, ntcells);
+}
+#endif
+
+static double title_length(void) {
+    return ntcells ? title_len : total_blocks / linear_bps;
+}
+
+static double time_at_block(uint32_t b) {
+    if (!ntcells) return b / linear_bps;
+    for (int i = 0; i < ntcells; i++) {
+        if (b >= tcells[i].first && b <= tcells[i].last)
+            return tcells[i].start + tcells[i].dur *
+                   (double)(b - tcells[i].first) / (tcells[i].last - tcells[i].first + 1);
+    }
+    // between cells: start of the next cell on the disc (or the end)
+    for (int i = 0; i < ntcells; i++)
+        if (tcells[i].first > b) return tcells[i].start;
+    return title_len;
+}
+
+static uint32_t block_at_time(double t, int *cell) {
+    if (!ntcells) {
+        double b = t * linear_bps;
+        if (b < 0) b = 0;
+        if (b >= total_blocks) b = total_blocks - 1;
+        *cell = 0;
+        return (uint32_t)b;
+    }
+    for (int i = 0; i < ntcells; i++) {
+        if (t < tcells[i].start + tcells[i].dur || i == ntcells - 1) {
+            double f = tcells[i].dur > 0 ? (t - tcells[i].start) / tcells[i].dur : 0;
+            if (f < 0) f = 0;
+            if (f > 1) f = 1;
+            *cell = i;
+            return tcells[i].first +
+                   (uint32_t)(f * (tcells[i].last - tcells[i].first));
+        }
+    }
+    *cell = 0;
+    return tcells[0].first;
+}
+
+// Read the next block of the title, following the cells in order.
+static int read_title_block(uint8_t *b) {
+    if (ntcells) {
+        if (title_done) return 0;
+        if (dvd_block > tcells[cur_cell].last || dvd_block < tcells[cur_cell].first) {
+            if (dvd_block > tcells[cur_cell].last) cur_cell++;
+            if (cur_cell >= ntcells) { title_done = 1; return 0; }
+            if (dvd_block < tcells[cur_cell].first || dvd_block > tcells[cur_cell].last)
+                dvd_block = tcells[cur_cell].first;     // next cell elsewhere on disc
+        }
+    } else if (dvd_block >= total_blocks) {
+        return 0;
+    }
+    return read_block(dvd_block++, b);
+}
+
+static int at_title_end(void) {
+    return ntcells ? title_done : dvd_block >= total_blocks;
+}
+
+static void title_start(void) {
+    cur_cell = 0;
+    title_done = 0;
+    dvd_block = ntcells ? tcells[0].first : 0;
+    disp_block = dvd_block;
+}
+
+static double position_now(void) {
+    return time_at_block(disp_block);
+}
+
+static int chapter_at(double t) {
+    int c = 0;
+    for (int i = 0; i < ntchap; i++)
+        if (tchap[i] <= t + 0.01) c = i;
+    return c;
+}
+
+static void osd_show(double t) {
+    int len = (int)title_length(), tt = (int)(t + 0.5);
+    char tm[48];
+    snprintf(tm, sizeof(tm), "%d:%02d:%02d / %d:%02d:%02d",
+             tt / 3600, (tt / 60) % 60, tt % 60, len / 3600, (len / 60) % 60, len % 60);
+    if (ntchap > 1)
+        snprintf(osd_text, sizeof(osd_text), "Chapter %d/%d   %s",
+                 chapter_at(t) + 1, ntchap, tm);
+    else
+        snprintf(osd_text, sizeof(osd_text), "%s", tm);
+    osd_until_us = now_us() + 2000000;
+    need_redraw = 1;
+    fprintf(stderr, "Seek: %s\n", osd_text);
+}
+
+static void draw_osd(void) {
+    int w;
+    if (!osd_text[0] || now_us() > osd_until_us) return;
+    w = 8 + 6 * (int)strlen(osd_text);   // "fixed" font: 6 px per char
+    XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+    XFillRectangle(dpy, win, gc, 10, 10, w, 20);
+    XSetForeground(dpy, gc, WhitePixel(dpy, DefaultScreen(dpy)));
+    XDrawString(dpy, win, gc, 14, 25, osd_text, strlen(osd_text));
+}
+
+static void request_seek_time(double t) {
+    double len = title_length();
+    if (t > len - 1.0) t = len - 1.0;
+    if (t < 0) t = 0;
+    seek_target_time = t;
+    seek_target_block = block_at_time(t, &seek_target_cell);
+    seek_pending = 1;
+    osd_show(t);
+}
+
+// relative jump; key repeats while a seek is pending add up
+static void seek_relative(double secs) {
+    request_seek_time((seek_pending ? seek_target_time : position_now()) + secs);
+}
+
+static void seek_chapter(int dir) {
+    double now = seek_pending ? seek_target_time : position_now();
+    if (ntchap < 2) {                     // no chapter list: 1/8 of the title
+        seek_relative(dir * title_length() / 8.0);
+        return;
+    }
+    if (dir > 0) {
+        for (int i = 0; i < ntchap; i++)
+            if (tchap[i] > now + 0.5) { request_seek_time(tchap[i]); return; }
+    } else {
+        // within 3 s of a chapter start: the previous chapter, else this one
+        for (int i = ntchap - 1; i >= 0; i--)
+            if (tchap[i] < now - 3.0) { request_seek_time(tchap[i]); return; }
+        request_seek_time(0);
+    }
+}
+
+// mouse click: position in the window = position in the title
+static void request_seek(double frac) {
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+    request_seek_time(frac * title_length());
+}
+
+// called when a seek is carried out
+static void seek_apply(void) {
+    seek_pending = 0;
+    dvd_block = seek_target_block;
+    cur_cell = seek_target_cell;
+    title_done = 0;
+    disp_block = dvd_block;
+}
+
+// which disc block the shown picture came from: PES pts -> block
+#define PTSMAP 128
+static struct { int64_t pts; uint32_t block; } ptsmap[PTSMAP];
+static int ptsmap_pos = 0;
+
+static __attribute__((unused)) void ptsmap_add(int64_t pts, uint32_t block) {
+    ptsmap[ptsmap_pos].pts = pts;
+    ptsmap[ptsmap_pos].block = block;
+    ptsmap_pos = (ptsmap_pos + 1) % PTSMAP;
+}
+
+static __attribute__((unused)) void ptsmap_shown(int64_t pts) {
+    static int64_t a_pts = PTS_NONE;
+    static uint32_t a_block;
+    if (pts == PTS_NONE) return;
+    for (int i = 0; i < PTSMAP; i++) {
+        if (ptsmap[i].pts == pts && ptsmap[i].block) {
+            disp_block = ptsmap[i].block;
+            // linear mode: learn blocks per second from playback
+            if (!ntcells) {
+                if (a_pts == PTS_NONE || pts < a_pts || disp_block < a_block) {
+                    a_pts = pts;
+                    a_block = disp_block;
+                } else if (pts - a_pts > 5 * PTS_HZ) {
+                    linear_bps = (disp_block - a_block) * (double)PTS_HZ / (pts - a_pts);
+                    if (linear_bps < 50) linear_bps = 50;
+                    a_pts = pts;
+                    a_block = disp_block;
+                }
+            }
+            return;
+        }
+    }
 }
 
 // PTS of the PES packet starting at p (00 00 01 id ...), or PTS_NONE
@@ -1284,7 +1581,10 @@ static void video_feed(uint8_t *data, int len, int64_t pts) {
     vq_len[slot] = (uint16_t)len;
     vq_pts[slot] = pts;
     vq_count++;
-    if (pts != PTS_NONE) vq_last_pts = pts;
+    if (pts != PTS_NONE) {
+        vq_last_pts = pts;
+        ptsmap_add(pts, dvd_block - 1);   // block just read
+    }
 }
 
 // Subtitle waiting for its PTS
@@ -1471,6 +1771,7 @@ static void redraw(void) {
         XRenderComposite(dpy, PictOpSrc, render_src, None, render_dst,
                          0, 0, 0, 0, dx, dy, dst_w, dst_h);
         if (show_help) draw_help_overlay();
+        draw_osd();
         if (dbg.xsync) XSync(dpy, False);
         else XFlush(dpy);
         return;
@@ -1501,6 +1802,7 @@ static void redraw(void) {
         XPutImage(dpy, win, gc, ximg, 0, 0, dx, dy, dst_w, dst_h);
     }
     if (show_help) draw_help_overlay();
+    draw_osd();
     if (dbg.xsync) XSync(dpy, False);
     else XFlush(dpy);
 }
@@ -1564,20 +1866,19 @@ static void av_test_log(int64_t pts, int dropped) {
 
 #ifdef SYNC_OLD
 static void playback_step(void) {
-	if (dvd_block >= total_blocks) { running = 0; return; }
+	if (at_title_end()) { running = 0; return; }
 	static struct timespec pacemaker_tid;
 	static int pacemaker_initialiseret = 0;
 	
 
 	if (seek_pending) {
-		seek_pending = 0;
-		dvd_block = seek_target_block;
+		seek_apply();
 		audio_flush();	// Flush audio device buffer (optional but good)
 		return; // refill pipeline cleanly
 	}
 	
     if (mpeg2_parse(mpeg2) == STATE_BUFFER) {	// Feed decoder if it needs data
-        if (read_block(dvd_block++, buf) != 1) {
+        if (read_title_block(buf) != 1) {
             return;
         }
 		demux_ps(buf, 2048);
@@ -1632,6 +1933,7 @@ if (pacemaker_initialiseret) {
 pacemaker_tid = nu_tid;
 // --- AUDIO-AWARE PACEMAKER SLUT ---
 			redraw();
+			disp_block = dvd_block;
 #ifdef AUDIO_HAVE_SIM
 			av_test_log(PTS_NONE, 0);
 #endif
@@ -1701,6 +2003,9 @@ static int audio_clock_sample(int64_t *out) {
 
 static void clock_update(void) {
     int64_t s, est;
+    // end of the title: no more audio is coming, so the audio position stops
+    // moving; don't let that hold back the last video frames
+    if (at_title_end() && aq_fill == 0) return;
     if (!audio_clock_sample(&s)) return;
     est = clock_now();
     if (est == PTS_NONE) { clock_set(s); clock_window_reset(); clk_audio_us = now_us(); return; }
@@ -1779,7 +2084,7 @@ static int64_t clock_wait_since_us = 0;
 static int64_t last_step_us = 0;
 
 static int need_more_data(void) {
-    if (dvd_block >= total_blocks) return 0;
+    if (at_title_end()) return 0;
     if (vq_count > VQ_SLOTS - 8) return 0;
     if (AQ_FRAMES - aq_fill < 8 * 1536) return 0;
     // don't read far ahead once there is audio queued and video waiting
@@ -1849,6 +2154,7 @@ static int decode_next_frame(void) {
 
 static void show_frame(int64_t late) {
     have_frame = 1;
+    ptsmap_shown(frame_pts);
     video_x = (win_w - video_w) / 2;
     video_y = (win_h - video_h) / 2;
     {
@@ -1976,8 +2282,7 @@ static void playback_step(void) {
     int64_t t = now_us();
 
     if (seek_pending) {
-        seek_pending = 0;
-        dvd_block = seek_target_block;
+        seek_apply();
         av_reset();
         return;
     }
@@ -2003,7 +2308,7 @@ static void playback_step(void) {
     }
     for (int n = 0; need_more_data() && (n == 0 || now_us() < read_until); n++) {
         int64_t r0 = now_us();
-        int ok = read_block(dvd_block++, buf);
+        int ok = read_title_block(buf);
         if (dbg.level) {
             double ms = (now_us() - r0) / 1000.0;
             dbg.blocks++;
@@ -2089,7 +2394,7 @@ static void playback_step(void) {
             sleep_us(5000);
         }
     } else if (!busy) {
-        if (dvd_block >= total_blocks && vq_count == 0) {
+        if (at_title_end() && vq_count == 0) {
             running = 0;                      // end of title
             return;
         }
@@ -2150,7 +2455,13 @@ int main(int argc, char **argv) {
 #endif
 	fprintf(stderr, "VOB size: %d blocks\n", total_blocks);
 
-    dvd_block = 0;
+#ifdef TEST_PLAIN_VOB
+	if (getenv("MINIDVD_TEST_CELLS")) title_map_from_string(getenv("MINIDVD_TEST_CELLS"));
+#else
+	if (!title_map_from_ifo(ifo))
+		fprintf(stderr, "Title: no usable program chain, playing the whole title set\n");
+#endif
+	title_start();                        // first cell of the film
 	mpeg2 = mpeg2_init();
 #ifdef SYNC_OLD
 	mpeg2_tag_picture(mpeg2, 0, 1);
@@ -2186,7 +2497,7 @@ int main(int argc, char **argv) {
 	while (running) {
 		if (sigint_received) { running = 0; break; }
 #ifdef TEST_PLAIN_VOB
-		{   // test script: MINIDVD_TEST="sec:seek:frac,sec:audio,sec:pause:secs,sec:size:WxH,sec:help"
+		{   // test script: MINIDVD_TEST="sec:seek:frac,sec:audio,sec:pause:secs,sec:size:WxH,sec:help,sec:jump:secs,sec:chap:+1|-1"
 			static const char *ts = NULL;
 			static int64_t t_start, unpause_at;
 			int64_t el;
@@ -2200,6 +2511,8 @@ int main(int argc, char **argv) {
 				if (!strncmp(a, "seek:", 5)) request_seek(atof(a + 5));
 				else if (!strncmp(a, "pause:", 6)) { paused = 1; unpause_at = el + (int64_t)(atof(a + 6) * 1e6); }
 				else if (!strncmp(a, "help", 4)) { show_help = !show_help; need_redraw = 1; }
+				else if (!strncmp(a, "jump:", 5)) seek_relative(atof(a + 5));
+				else if (!strncmp(a, "chap:", 5)) seek_chapter(atoi(a + 5));
 				else if (!strncmp(a, "size:", 5)) {   // size:WxH resizes the window
 					int w = atoi(a + 5), h = strchr(a, 'x') ? atoi(strchr(a, 'x') + 1) : 0;
 					if (w > 0 && h > 0) XResizeWindow(dpy, win, w, h);
@@ -2244,6 +2557,14 @@ int main(int argc, char **argv) {
                 KeySym ks = XLookupKeysym(&ev.xkey, 0);
                 if (ks == XK_q || ks == XK_Escape) {
 					running = 0;
+					break;
+				} else if (ks == XK_Left || ks == XK_Right) {
+					int dir = ks == XK_Right ? 1 : -1;
+					if (ev.xkey.state & ShiftMask) seek_chapter(dir);
+					else seek_relative(dir * 10.0);
+					break;
+				} else if (ks == XK_Up || ks == XK_Down) {
+					seek_relative(ks == XK_Up ? 60.0 : -60.0);
 					break;
 				} else if (ks == XK_space) {
 					if (show_help) {
@@ -2332,6 +2653,10 @@ int main(int argc, char **argv) {
             }
         }
         if (paused) {
+			if (osd_text[0] && now_us() > osd_until_us) {
+				osd_text[0] = 0;
+				need_redraw = 1;
+			}
 			if (need_redraw) {
 				redraw();
 				need_redraw = 0;
