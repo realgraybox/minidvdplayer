@@ -39,10 +39,13 @@ Timing diagnostics (new timing only):
     MINIDVD_DEBUG=2 minidvd /dev/dvd    # also one line per frame
     MINIDVD_XSYNC=1 minidvd /dev/dvd    # wait for the X server after every frame
     MINIDVD_NOSHM=1 minidvd /dev/dvd    # don't use MIT-SHM (shared memory) for drawing
+    MINIDVD_NORENDER=1 minidvd /dev/dvd # scale on the CPU instead of with XRender
 
-Frames are handed to X through shared memory (MIT-SHM) when the X server
-supports it, which is much cheaper than sending them through the X socket;
-otherwise minidvd falls back to plain XPutImage. Building needs libXext.
+Frames are handed to X at video size through shared memory (MIT-SHM) and
+the X server scales them to the window with XRender (on the GPU with most
+drivers), so a resized or fullscreen window costs the same as the normal
+size. Without MIT-SHM minidvd uses plain XPutImage; without XRender it
+scales on the CPU. Building needs libXext and libXrender.
 
 ## Usage
 

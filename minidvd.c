@@ -17,6 +17,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <X11/extensions/XShm.h>
+#include <X11/extensions/Xrender.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
@@ -53,6 +54,7 @@ static struct {
     long frames, drops, slow_draws, slow_reads, blocks;
     double iv_sum, iv_sq, late_sum, late_max, draw_sum, draw_max;
     double dec_sum, dec_max, rd_max, rd_frame_max, dec_frame;
+    double wait_ms, wait_sum, wait_max;  // waiting for the X server (in draw)
     long hist[9];                 // shown-frame interval buckets
     long clk_fwd, clk_back, clk_stall, clk_jump, clk_discont, starved;
     double clk_fwd_sum, clk_fwd_max, clk_back_sum, clk_stall_sum, clk_adj;
@@ -194,6 +196,18 @@ static int use_shm = 0;            // -1 = try, 1 = in use, 0 = off
 static int shm_failed = 0;
 static int shm_put_pending = 0;    // server may still be reading ximg
 static void recreate_ximage(int w, int h);
+
+// XRender: the frame is uploaded at video size into a server-side pixmap
+// and the X server scales it onto the window (on the GPU where the driver
+// supports it). Without RENDER, or with MINIDVD_NORENDER=1, minidvd scales
+// on the CPU and uploads the full window-sized image.
+static int use_render = 0;
+static XRenderPictFormat *render_fmt;
+static Picture render_dst = None;  // the window
+static Picture render_src = None;  // the video pixmap
+static Pixmap render_pix = None;
+static int render_pix_w, render_pix_h;
+static int render_tr_w, render_tr_h;   // destination size the transform is set for
 
 // Bilinear scaler for 32-bit xRGB with 8-bit weights. Each source row is
 // scaled horizontally once (two rows cached), then pairs of rows are blended
@@ -1021,7 +1035,57 @@ static void x11_init(int w, int h) {
     // of receiving them through the socket. Off for remote displays (it
     // fails to attach) or with MINIDVD_NOSHM=1.
     use_shm = XShmQueryExtension(dpy) && !getenv("MINIDVD_NOSHM") ? -1 : 0;
+    {
+        int ev, er;
+        if (!getenv("MINIDVD_NORENDER") && XRenderQueryExtension(dpy, &ev, &er) &&
+            (render_fmt = XRenderFindVisualFormat(dpy, DefaultVisual(dpy, s))) != NULL) {
+            render_dst = XRenderCreatePicture(dpy, win, render_fmt, 0, NULL);
+            use_render = 1;
+            fprintf(stderr, "Video: XRender scaling\n");
+        } else {
+            fprintf(stderr, "Video: CPU scaling\n");
+        }
+    }
     recreate_ximage(w, h);
+}
+
+// server-side pixmap holding the current frame at video size
+static void render_ensure_pixmap(int w, int h) {
+    XRenderPictureAttributes pa;
+    if (render_pix && render_pix_w == w && render_pix_h == h) return;
+    if (render_src) XRenderFreePicture(dpy, render_src);
+    if (render_pix) XFreePixmap(dpy, render_pix);
+    render_pix = XCreatePixmap(dpy, win, w, h, DefaultDepth(dpy, DefaultScreen(dpy)));
+    pa.repeat = RepeatPad;                // bilinear edges: repeat border pixels
+    render_src = XRenderCreatePicture(dpy, render_pix, render_fmt, CPRepeat, &pa);
+    render_pix_w = w;
+    render_pix_h = h;
+    render_tr_w = render_tr_h = -1;       // force a new transform
+}
+
+static void render_set_scale(int dw, int dh) {
+    XTransform t;
+    if (dw == render_tr_w && dh == render_tr_h) return;
+    memset(&t, 0, sizeof(t));
+    // maps destination pixels to source pixels
+    t.matrix[0][0] = XDoubleToFixed((double)render_pix_w / dw);
+    t.matrix[1][1] = XDoubleToFixed((double)render_pix_h / dh);
+    t.matrix[2][2] = XDoubleToFixed(1.0);
+    XRenderSetPictureTransform(dpy, render_src, &t);
+    if (dw == render_pix_w && dh == render_pix_h)
+        XRenderSetPictureFilter(dpy, render_src, FilterNearest, NULL, 0);  // 1:1 copy
+    else
+        XRenderSetPictureFilter(dpy, render_src, FilterBilinear, NULL, 0);
+    render_tr_w = dw;
+    render_tr_h = dh;
+}
+
+static void render_cleanup(void) {
+    if (render_src) XRenderFreePicture(dpy, render_src);
+    if (render_pix) XFreePixmap(dpy, render_pix);
+    if (render_dst) XRenderFreePicture(dpy, render_dst);
+    render_src = render_dst = None;
+    render_pix = None;
 }
 
 static int shm_attach_error(Display *d, XErrorEvent *e) {
@@ -1079,6 +1143,12 @@ static XImage *create_shm_image(int w, int h) {
 
 static void recreate_ximage(int w, int h) {
     int s = DefaultScreen(dpy);
+    if (use_render) {                     // image = video frame, X scales it
+        w = video_w;
+        h = video_h;
+        render_ensure_pixmap(w, h);
+        if (ximg && ximg->width == w && ximg->height == h) return;
+    }
     destroy_ximage();
     if (use_shm) {
         ximg = create_shm_image(w, h);
@@ -1347,8 +1417,32 @@ static void redraw(void) {
     int dy = (win_h - dst_h) / 2;
     const uint8_t *src = info->display_fbuf->buf[0];
     if (shm_put_pending) {                // previous frame still being read?
+        int64_t w0 = now_us();
         XSync(dpy, False);
         shm_put_pending = 0;
+        dbg.wait_ms += (now_us() - w0) / 1000.0;
+    }
+    if (use_render) {
+        // video-sized frame + subtitles -> pixmap; X scales it to the window
+        memcpy(ximg->data, src, video_w * video_h * 4);
+        uint64_t now_subtitle = current_time_ms();
+        if (sub_valid && (now_subtitle - last_sub_time_ms > sub_display_duration_ms))
+            sub_valid = 0;
+        if (subtitle_enabled && subtitle_active && sub_valid)
+            overlay_subtitle((uint8_t *)ximg->data, video_w, video_h);
+        if (shminfo.shmaddr) {
+            XShmPutImage(dpy, render_pix, gc, ximg, 0, 0, 0, 0, video_w, video_h, False);
+            shm_put_pending = 1;
+        } else {
+            XPutImage(dpy, render_pix, gc, ximg, 0, 0, 0, 0, video_w, video_h);
+        }
+        render_set_scale(dst_w, dst_h);
+        XRenderComposite(dpy, PictOpSrc, render_src, None, render_dst,
+                         0, 0, 0, 0, dx, dy, dst_w, dst_h);
+        if (show_help) draw_help_overlay();
+        if (dbg.xsync) XSync(dpy, False);
+        else XFlush(dpy);
+        return;
     }
     // scale or copy
     if (!scale_video) {
@@ -1738,6 +1832,9 @@ static void show_frame(int64_t late) {
             dbg.late_sum += late / 90.0;
             if (late / 90.0 > dbg.late_max) dbg.late_max = late / 90.0;
             dbg.draw_sum += draw;
+            dbg.wait_sum += dbg.wait_ms;
+            if (dbg.wait_ms > dbg.wait_max) dbg.wait_max = dbg.wait_ms;
+            dbg.wait_ms = 0;
             if (draw > dbg.draw_max) dbg.draw_max = draw;
             if (draw > 10.0) dbg.slow_draws++;
             if (dbg.level > 1)
@@ -1762,11 +1859,12 @@ static void dbg_summary(void) {
         sd = sd > 0 ? __builtin_sqrt(sd) : 0;
     }
     fprintf(stderr, "\n==== minidvd timing summary ====\n");
-    fprintf(stderr, "audio backend: %s   xsync: %s   shm: %s\n",
+    fprintf(stderr, "audio backend: %s   xsync: %s   shm: %s   scaling: %s\n",
             audio_get_backend() == AUDIO_BACKEND_TINYALSA ? "tinyalsa" :
             audio_get_backend() == AUDIO_BACKEND_OSS ? "OSS" :
             audio_get_backend() == AUDIO_BACKEND_NONE ? "none" : "simulated",
-            dbg.xsync ? "on" : "off", shminfo.shmaddr ? "on" : "off");
+            dbg.xsync ? "on" : "off", shminfo.shmaddr ? "on" : "off",
+            use_render ? "XRender" : "CPU");
     fprintf(stderr, "frames shown %ld, dropped %ld\n", dbg.frames, dbg.drops);
     fprintf(stderr, "interval after draw (ms): mean %.1f sd %.1f\n", mean, sd);
     fprintf(stderr, "  ");
@@ -1774,8 +1872,9 @@ static void dbg_summary(void) {
     fprintf(stderr, "\n");
     fprintf(stderr, "late at show (ms): avg %.1f max %.1f\n",
             dbg.late_sum / dbg.frames, dbg.late_max);
-    fprintf(stderr, "draw (ms): avg %.1f max %.1f, >10ms: %ld\n",
-            dbg.draw_sum / dbg.frames, dbg.draw_max, dbg.slow_draws);
+    fprintf(stderr, "draw (ms): avg %.1f max %.1f, >10ms: %ld  (of which waiting for X: avg %.1f max %.1f)\n",
+            dbg.draw_sum / dbg.frames, dbg.draw_max, dbg.slow_draws,
+            dbg.wait_sum / dbg.frames, dbg.wait_max);
     fprintf(stderr, "decode per frame (ms): avg %.1f max %.1f\n",
             dbg.dec_sum / dbg.frames, dbg.dec_max);
     fprintf(stderr, "disc reads: %ld blocks, slowest %.1f ms, >20ms: %ld\n",
@@ -2040,7 +2139,7 @@ int main(int argc, char **argv) {
 	while (running) {
 		if (sigint_received) { running = 0; break; }
 #ifdef TEST_PLAIN_VOB
-		{   // test script: MINIDVD_TEST="sec:seek:frac,sec:audio,sec:pause:secs,sec:size:WxH"
+		{   // test script: MINIDVD_TEST="sec:seek:frac,sec:audio,sec:pause:secs,sec:size:WxH,sec:help"
 			static const char *ts = NULL;
 			static int64_t t_start, unpause_at;
 			int64_t el;
@@ -2053,6 +2152,7 @@ int main(int argc, char **argv) {
 				fprintf(stderr, "TEST %.40s\n", a);
 				if (!strncmp(a, "seek:", 5)) request_seek(atof(a + 5));
 				else if (!strncmp(a, "pause:", 6)) { paused = 1; unpause_at = el + (int64_t)(atof(a + 6) * 1e6); }
+				else if (!strncmp(a, "help", 4)) { show_help = !show_help; need_redraw = 1; }
 				else if (!strncmp(a, "size:", 5)) {   // size:WxH resizes the window
 					int w = atoi(a + 5), h = strchr(a, 'x') ? atoi(strchr(a, 'x') + 1) : 0;
 					if (w > 0 && h > 0) XResizeWindow(dpy, win, w, h);
@@ -2226,6 +2326,7 @@ int main(int argc, char **argv) {
 #ifndef SYNC_OLD
 	dbg_summary();
 #endif
+	render_cleanup();
 	if (ximg) {
 		destroy_ximage();
 	}

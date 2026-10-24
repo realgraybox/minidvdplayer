@@ -13,7 +13,8 @@ Test-only compile flags (never used for normal builds):
   for every subtitle `SPU <pts> <clock>`.
 - `MINIDVD_TEST="sec:action,..."` (with `TEST_PLAIN_VOB`): scripted
   `seek:<fraction>`, `pause:<seconds>` and `audio` (toggle audio stream
-  0x80/0x81) and `size:<W>x<H>` (resize the window, i.e. scaled drawing).
+  0x80/0x81) `size:<W>x<H>` (resize the window, i.e. scaled drawing) and `help`
+  (toggle the help screen).
 
 Files:
 

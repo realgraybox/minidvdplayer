@@ -13,7 +13,7 @@
 #   HOST        autoconf --host triplet, only needed when cross compiling
 #   LIB_CFLAGS  CFLAGS for the bundled libraries
 #   LIB_LDFLAGS LDFLAGS for the bundled libraries
-#   X11_LIBS    X11 link line (defaults to pkg-config xext x11, else -lXext -lX11)
+#   X11_LIBS    X11 link line (defaults to pkg-config xrender xext x11, else -lXrender -lXext -lX11)
 #   STATIC      '-static' to link statically; default only for uClibc compilers
 #   SYNC        'old' builds the previous A/V timing (see minidvd.c)
 
@@ -124,7 +124,7 @@ CFLAGS += -Wall -Wunused -std=gnu99 -I./$(DVDREAD_DIR)/src -I./ \
 		-ffast-math -fno-math-errno \
 		$(AUDIO_CFLAGS) $(SYNC_CFLAGS) $(EXTRA_CFLAGS)
 
-X11_LIBS ?= $(shell pkg-config $(if $(STATIC),--static) --libs xext x11 2>/dev/null || echo -lXext -lX11)
+X11_LIBS ?= $(shell pkg-config $(if $(STATIC),--static) --libs xrender xext x11 2>/dev/null || echo -lXrender -lXext -lX11)
 
 LDFLAGS = $(STATIC) -Wl,--gc-sections,--sort-common,-s
 LDLIBS  = $(LIB_ARCHIVES) $(X11_LIBS) -lm
