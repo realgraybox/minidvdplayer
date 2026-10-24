@@ -1818,6 +1818,14 @@ static void show_frame(int64_t late) {
         redraw();
         t1 = now_us();
         draw = (t1 - t0) / 1000.0;
+        // learn how long drawing takes, so the next frame can be started
+        // that much early and appear on time (at most 3/4 of a frame)
+        {
+            int64_t d90 = (t1 - t0) * 9 / 100;
+            draw_early += (d90 - draw_early) / 8;
+            if (draw_early > frame_dur * 3 / 4) draw_early = frame_dur * 3 / 4;
+            if (draw_early < 0) draw_early = 0;
+        }
         iv = prev_end ? (t1 - prev_end) / 1000.0 : 40.0;
         prev_end = t1;
         if (dbg.level) {
@@ -2011,7 +2019,7 @@ static void playback_step(void) {
             int64_t diff;
             clock_wait_since_us = 0;
             if (frame_pts == PTS_NONE) frame_pts = now;
-            diff = frame_pts + av_offset - now;
+            diff = frame_pts + av_offset - draw_early - now;
             if (frame_discont || diff > 2 * PTS_HZ ||
                 (diff < -PTS_HZ && !clock_on_audio())) {
                 // timestamp jump (cell change etc.), or far off with nothing
