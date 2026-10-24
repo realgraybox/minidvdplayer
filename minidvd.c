@@ -1521,6 +1521,7 @@ static int64_t audio_ignore_until_us = 0;
 static int64_t clk_win_max = PTS_NONE;   // max (report - clock) this window
 static int64_t clk_win_us = 0;
 static int64_t av_offset = 0;            // MINIDVD_AV_OFFSET (ms) in 90 kHz units
+static int64_t draw_early = 0;           // start drawing this much early (90 kHz)
 static int64_t clk_audio_us = 0;         // last time an audio report was used
 
 // is the clock currently following the audio?
@@ -1608,8 +1609,9 @@ static void clock_update(void) {
 // ---- audio output: never blocks ---------------------------------------------
 static void audio_pump(void) {
     if (audio_get_backend() == AUDIO_BACKEND_NONE) {
-        aq_rd = aq_fill = 0;                // nothing to play it on
-        return;
+        if (audio_ready)                    // opening failed: nothing to play it on
+            aq_rd = aq_fill = 0;
+        return;                             // else: device not opened yet, keep it
     }
     int budget = audio_get_space();
     if (budget < 0) budget = 1024;          // unknown: small (possibly blocking) writes
@@ -1840,8 +1842,19 @@ static void playback_step(void) {
     audio_pump();
     clock_update();
 
-    // 1. read ahead
-    for (int n = 0; n < 16 && need_more_data(); n++) {
+    // 1. read ahead: as long as the queues want data, for up to 8 ms per
+    //    pass, but stop 2 ms before the next frame is due. (A fixed number of
+    //    blocks per pass could not keep up with high-bitrate scenes when
+    //    drawing is slow and the loop only runs about once per frame.)
+    int64_t read_until = t + 8000;
+    if (frame_ready && frame_pts != PTS_NONE) {
+        int64_t now = clock_now();
+        if (now != PTS_NONE) {
+            int64_t due = t + (frame_pts + av_offset - draw_early - now) * 100 / 9 - 2000;
+            if (due < read_until) read_until = due;
+        }
+    }
+    for (int n = 0; need_more_data() && (n == 0 || now_us() < read_until); n++) {
         int64_t r0 = now_us();
         int ok = read_block(dvd_block++, buf);
         if (dbg.level) {
