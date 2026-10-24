@@ -16,6 +16,9 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/extensions/XShm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 
 #include <dvdread/dvd_reader.h>
 #include <dvdread/ifo_read.h>
@@ -36,19 +39,11 @@
  *                  clock that is locked to the audio playback position.
  *                  Audio is written without blocking, so it never stalls video.
  *   -DSYNC_OLD:    previous behaviour: video is paced by blocking audio writes
- *                  (plus the LOGGING "pacemaker").
+ *                  (plus the "pacemaker").
  * Test hooks (not for normal builds):
  *   -DTEST_PLAIN_VOB   argv[1] is a plain MPEG-PS/VOB file instead of a DVD
  *   -DAUDIO_HAVE_SIM   simulated sound card; prints per-frame "AV" log lines
  */
-
-//frame/redraw logning
-#ifdef LOGGING
-// Globale eller statiske variabler til at huske tiden
-static struct timespec sidste_tid;
-static int forste_gennemlob = 1;
-//end
-#endif
 
 // Diagnostics (new timing): MINIDVD_DEBUG=1 prints a summary on exit,
 // MINIDVD_DEBUG=2 also one line per frame. MINIDVD_XSYNC=1 waits for the X
@@ -194,44 +189,78 @@ static Display *dpy;
 static Window win;
 static GC gc;
 static XImage *ximg;
+static XShmSegmentInfo shminfo;    // shminfo.shmaddr != NULL: ximg is in shared memory
+static int use_shm = 0;            // -1 = try, 1 = in use, 0 = off
+static int shm_failed = 0;
+static int shm_put_pending = 0;    // server may still be reading ximg
+static void recreate_ximage(int w, int h);
 
-//scaling uses 8.8 fixed-point
-static void scale_bilinear_rgba(uint8_t *dst, int dw, int dh,
-    const uint8_t *src, int sw, int sh) {
+// Bilinear scaler for 32-bit xRGB with 8-bit weights. Each source row is
+// scaled horizontally once (two rows cached), then pairs of rows are blended
+// vertically. R+B and G are processed together in one 32-bit word.
+#define SCALE_MAX_W 4096
+static uint32_t scale_xofs[SCALE_MAX_W];      // source x0 per dest column
+static uint32_t scale_xfrac[SCALE_MAX_W];     // weight of x0+1, 0..255
+static uint32_t scale_rowbuf[2][SCALE_MAX_W]; // horizontally scaled rows
+static int scale_tab_sw = -1, scale_tab_dw = -1;
 
-    const int FP = 8;
-    const int ONE = 1 << FP;
+static inline uint32_t mix32(uint32_t a, uint32_t b, uint32_t f) {
+    // (a*(256-f) + b*f) / 256 for each 8-bit channel, f = 0..255
+    uint32_t rb = ((a & 0x00FF00FF) * (256 - f) + (b & 0x00FF00FF) * f) >> 8;
+    uint32_t g  = ((a & 0x0000FF00) * (256 - f) + (b & 0x0000FF00) * f) >> 8;
+    return (rb & 0x00FF00FF) | (g & 0x0000FF00);
+}
 
-    int xstep = ((sw - 1) << FP) / dw;
-    int ystep = ((sh - 1) << FP) / dh;
+static void scale_hrow(uint32_t *out, const uint32_t *src, int dw) {
+    for (int x = 0; x < dw; x++) {
+        const uint32_t *p = src + scale_xofs[x];
+        uint32_t f = scale_xfrac[x];
+        out[x] = f ? mix32(p[0], p[1], f) : p[0];
+    }
+}
 
-    for (int y = 0, sy = 0; y < dh; y++, sy += ystep) {
-        int y0 = sy >> FP;
-        int y1 = y0 + (y0 + 1 < sh);
-        int fy = sy & (ONE - 1);
+//scaling: 16.16 fixed-point positions, 8-bit blend weights
+static void scale_bilinear_rgba(uint8_t *dst8, int dw, int dh,
+    const uint8_t *src8, int sw, int sh) {
+    const uint32_t *src = (const uint32_t *)src8;
+    uint32_t *dst = (uint32_t *)dst8;
+    uint32_t *top = scale_rowbuf[0], *bot = scale_rowbuf[1];
+    int top_y = -2;                       // source row in "top" (bot = top_y + 1); -2 = none
 
-        const uint8_t *row0 = src + 4 * y0 * sw;
-        const uint8_t *row1 = src + 4 * y1 * sw;
-        uint8_t *d = dst + 4 * y * dw;
+    if (dw > SCALE_MAX_W) dw = SCALE_MAX_W;
+    if (scale_tab_sw != sw || scale_tab_dw != dw) {
+        uint32_t xstep = ((uint32_t)(sw - 1) << 16) / dw, sx = 0;
+        for (int x = 0; x < dw; x++, sx += xstep) {
+            scale_xofs[x] = sx >> 16;
+            scale_xfrac[x] = (sx >> 8) & 0xFF;
+            if (scale_xofs[x] + 1 >= (uint32_t)sw)   // never read past the row
+                scale_xfrac[x] = 0;
+        }
+        scale_tab_sw = sw;
+        scale_tab_dw = dw;
+    }
 
-        for (int x = 0, sx = 0; x < dw; x++, sx += xstep, d += 4) {
-            int x0 = sx >> FP;
-            int x1 = x0 + (x0 + 1 < sw);
-            int fx = sx & (ONE - 1);
+    uint32_t ystep = ((uint32_t)(sh - 1) << 16) / dh, sy = 0;
+    for (int y = 0; y < dh; y++, sy += ystep) {
+        int y0 = sy >> 16;
+        int y1 = y0 + 1 < sh ? y0 + 1 : y0;
+        uint32_t fy = (sy >> 8) & 0xFF;
+        uint32_t *d = dst + (size_t)y * dw;
 
-            const uint8_t *p00 = row0 + 4 * x0;
-            const uint8_t *p10 = row0 + 4 * x1;
-            const uint8_t *p01 = row1 + 4 * x0;
-            const uint8_t *p11 = row1 + 4 * x1;
-
-            int wx0 = ONE - fx;
-            int wy0 = ONE - fy;
-
-            for (int c = 0; c < 4; c++) {
-                int a = p00[c] * wx0 + p10[c] * fx;
-                int b = p01[c] * wx0 + p11[c] * fx;
-                d[c] = (uint8_t)((a * wy0 + b * fy) >> (FP * 2));
+        if (y0 != top_y) {
+            if (top_y >= 0 && y0 == top_y + 1) {   // moved down one row: reuse
+                uint32_t *t = top; top = bot; bot = t;
+            } else {
+                scale_hrow(top, src + (size_t)y0 * sw, dw);
             }
+            scale_hrow(bot, src + (size_t)y1 * sw, dw);
+            top_y = y0;
+        }
+        if (!fy) {
+            memcpy(d, top, (size_t)dw * 4);
+        } else {
+            for (int x = 0; x < dw; x++)
+                d[x] = mix32(top[x], bot[x], fy);
         }
     }
 }
@@ -988,17 +1017,80 @@ static void x11_init(int w, int h) {
 	XFontStruct *font = XLoadQueryFont(dpy, "fixed");
 	if (font) XSetFont(dpy, gc, font->fid);
 
-    ximg = XCreateImage(dpy, DefaultVisual(dpy,s), DefaultDepth(dpy, s), ZPixmap, 0,
-        malloc(w*h*4), w, h, 32, 0);
+    // MIT-SHM: the X server reads frames straight from shared memory instead
+    // of receiving them through the socket. Off for remote displays (it
+    // fails to attach) or with MINIDVD_NOSHM=1.
+    use_shm = XShmQueryExtension(dpy) && !getenv("MINIDVD_NOSHM") ? -1 : 0;
+    recreate_ximage(w, h);
+}
+
+static int shm_attach_error(Display *d, XErrorEvent *e) {
+    (void)d; (void)e;
+    shm_failed = 1;
+    return 0;
+}
+
+static void destroy_ximage(void) {
+    if (!ximg) return;
+    if (shminfo.shmaddr) {
+        XSync(dpy, False);                // server finished with the segment
+        XShmDetach(dpy, &shminfo);
+        XSync(dpy, False);
+        shmdt(shminfo.shmaddr);
+        shminfo.shmaddr = NULL;
+        ximg->data = NULL;                // not malloc'ed: keep XDestroyImage off it
+    }
+    XDestroyImage(ximg);                  // frees malloc'ed data
+    ximg = NULL;
+    shm_put_pending = 0;
+}
+
+static XImage *create_shm_image(int w, int h) {
+    int s = DefaultScreen(dpy);
+    XErrorHandler old;
+    XImage *img = XShmCreateImage(dpy, DefaultVisual(dpy, s), DefaultDepth(dpy, s),
+                                  ZPixmap, NULL, &shminfo, w, h);
+    if (!img) return NULL;
+    shminfo.shmid = shmget(IPC_PRIVATE, (size_t)img->bytes_per_line * img->height,
+                           IPC_CREAT | 0600);
+    if (shminfo.shmid < 0) { XDestroyImage(img); return NULL; }
+    shminfo.shmaddr = img->data = shmat(shminfo.shmid, NULL, 0);
+    if (shminfo.shmaddr == (char *)-1) {
+        shmctl(shminfo.shmid, IPC_RMID, NULL);
+        shminfo.shmaddr = img->data = NULL;
+        XDestroyImage(img);
+        return NULL;
+    }
+    shminfo.readOnly = False;
+    shm_failed = 0;
+    old = XSetErrorHandler(shm_attach_error);
+    XShmAttach(dpy, &shminfo);
+    XSync(dpy, False);
+    XSetErrorHandler(old);
+    shmctl(shminfo.shmid, IPC_RMID, NULL);   // removed once both sides detach
+    if (shm_failed) {
+        shmdt(shminfo.shmaddr);
+        shminfo.shmaddr = img->data = NULL;
+        XDestroyImage(img);
+        return NULL;
+    }
+    return img;
 }
 
 static void recreate_ximage(int w, int h) {
-    if (ximg) {
-        XDestroyImage(ximg);   // frees data automatically
-        ximg = NULL;
-    }
     int s = DefaultScreen(dpy);
-    ximg = XCreateImage(dpy, DefaultVisual(dpy, s), DefaultDepth(dpy, s), ZPixmap, 0, 
+    destroy_ximage();
+    if (use_shm) {
+        ximg = create_shm_image(w, h);
+        if (ximg) {
+            if (use_shm < 0) fprintf(stderr, "Video: MIT-SHM\n");
+            use_shm = 1;
+            return;
+        }
+        fprintf(stderr, "Video: MIT-SHM not available, using XPutImage\n");
+        use_shm = 0;
+    }
+    ximg = XCreateImage(dpy, DefaultVisual(dpy, s), DefaultDepth(dpy, s), ZPixmap, 0,
 		malloc(w * h * 4), w, h, 32, 0);
 }
 
@@ -1254,6 +1346,10 @@ static void redraw(void) {
     int dx = (win_w - dst_w) / 2;
     int dy = (win_h - dst_h) / 2;
     const uint8_t *src = info->display_fbuf->buf[0];
+    if (shm_put_pending) {                // previous frame still being read?
+        XSync(dpy, False);
+        shm_put_pending = 0;
+    }
     // scale or copy
     if (!scale_video) {
         memcpy(ximg->data, src, video_w * video_h * 4);
@@ -1273,7 +1369,12 @@ static void redraw(void) {
         overlay_subtitle(ximg->data, dst_w, dst_h);
     }
 
-    XPutImage(dpy, win, gc, ximg, 0, 0, dx, dy, dst_w, dst_h);
+    if (shminfo.shmaddr) {
+        XShmPutImage(dpy, win, gc, ximg, 0, 0, dx, dy, dst_w, dst_h, False);
+        shm_put_pending = 1;
+    } else {
+        XPutImage(dpy, win, gc, ximg, 0, 0, dx, dy, dst_w, dst_h);
+    }
     if (show_help) draw_help_overlay();
     if (dbg.xsync) XSync(dpy, False);
     else XFlush(dpy);
@@ -1316,12 +1417,8 @@ static void av_test_log(int64_t pts, int dropped) {
 #ifdef SYNC_OLD
 static void playback_step(void) {
 	if (dvd_block >= total_blocks) { running = 0; return; }
-	//framelog
-#ifdef LOGGING
 	static struct timespec pacemaker_tid;
-static int pacemaker_initialiseret = 0;
-#endif	
-	//end
+	static int pacemaker_initialiseret = 0;
 	
 
 	if (seek_pending) {
@@ -1366,7 +1463,6 @@ static int pacemaker_initialiseret = 0;
 			// center video in window
 			video_x = (win_w - video_w) / 2;
 			video_y = (win_h - video_h) / 2;
-#ifdef LOGGING		
 			// --- AUDIO-AWARE PACEMAKER START ---
 struct timespec nu_tid;
 clock_gettime(CLOCK_MONOTONIC, &nu_tid);
@@ -1394,30 +1490,6 @@ if (pacemaker_initialiseret) {
 }
 pacemaker_tid = nu_tid;
 // --- AUDIO-AWARE PACEMAKER SLUT ---
-
-
-
-
-			
-			//framelogning
-			struct timespec nuvrende_tid;
-clock_gettime(CLOCK_MONOTONIC, &nuvrende_tid);
-
-if (!forste_gennemlob) {
-    // Beregn forskellen i mikrosekunder
-    long diff_us = (nuvrende_tid.tv_sec - sidste_tid.tv_sec) * 1000000 +
-                   (nuvrende_tid.tv_nsec - sidste_tid.tv_nsec) / 1000;
-    
-    // Print værdien ud (gem evt. i en fil eller kig i terminalen)
-    printf("Tid siden sidste redraw: %ld us\n", diff_us);
-} else {
-    forste_gennemlob = 0;
-}
-sidste_tid = nuvrende_tid;
-			
-			
-			//end
-#endif
 			redraw();
 #ifdef AUDIO_HAVE_SIM
 			av_test_log(PTS_NONE, 0);
@@ -1643,23 +1715,6 @@ static void show_frame(int64_t late) {
     have_frame = 1;
     video_x = (win_w - video_w) / 2;
     video_y = (win_h - video_h) / 2;
-#ifdef LOGGING
-    {
-        struct timespec nuvrende_tid;
-        clock_gettime(CLOCK_MONOTONIC, &nuvrende_tid);
-        if (!forste_gennemlob) {
-            long diff_us = (nuvrende_tid.tv_sec - sidste_tid.tv_sec) * 1000000 +
-                           (nuvrende_tid.tv_nsec - sidste_tid.tv_nsec) / 1000;
-            printf("Tid siden sidste redraw: %ld us (late %ld us)\n",
-                   diff_us, (long)(late * 100 / 9));
-        } else {
-            forste_gennemlob = 0;
-        }
-        sidste_tid = nuvrende_tid;
-    }
-#else
-    (void)late;
-#endif
     {
         static int64_t prev_end = 0;
         int64_t t0 = now_us(), t1;
@@ -1705,11 +1760,11 @@ static void dbg_summary(void) {
         sd = sd > 0 ? __builtin_sqrt(sd) : 0;
     }
     fprintf(stderr, "\n==== minidvd timing summary ====\n");
-    fprintf(stderr, "audio backend: %s   xsync: %s\n",
+    fprintf(stderr, "audio backend: %s   xsync: %s   shm: %s\n",
             audio_get_backend() == AUDIO_BACKEND_TINYALSA ? "tinyalsa" :
             audio_get_backend() == AUDIO_BACKEND_OSS ? "OSS" :
             audio_get_backend() == AUDIO_BACKEND_NONE ? "none" : "simulated",
-            dbg.xsync ? "on" : "off");
+            dbg.xsync ? "on" : "off", shminfo.shmaddr ? "on" : "off");
     fprintf(stderr, "frames shown %ld, dropped %ld\n", dbg.frames, dbg.drops);
     fprintf(stderr, "interval after draw (ms): mean %.1f sd %.1f\n", mean, sd);
     fprintf(stderr, "  ");
@@ -1972,7 +2027,7 @@ int main(int argc, char **argv) {
 	while (running) {
 		if (sigint_received) { running = 0; break; }
 #ifdef TEST_PLAIN_VOB
-		{   // test script: MINIDVD_TEST="sec:seek:frac,sec:audio,sec:pause:secs"
+		{   // test script: MINIDVD_TEST="sec:seek:frac,sec:audio,sec:pause:secs,sec:size:WxH"
 			static const char *ts = NULL;
 			static int64_t t_start, unpause_at;
 			int64_t el;
@@ -1985,6 +2040,10 @@ int main(int argc, char **argv) {
 				fprintf(stderr, "TEST %.40s\n", a);
 				if (!strncmp(a, "seek:", 5)) request_seek(atof(a + 5));
 				else if (!strncmp(a, "pause:", 6)) { paused = 1; unpause_at = el + (int64_t)(atof(a + 6) * 1e6); }
+				else if (!strncmp(a, "size:", 5)) {   // size:WxH resizes the window
+					int w = atoi(a + 5), h = strchr(a, 'x') ? atoi(strchr(a, 'x') + 1) : 0;
+					if (w > 0 && h > 0) XResizeWindow(dpy, win, w, h);
+				}
 				else if (!strncmp(a, "audio", 5)) {
 					audio_sid_selected = audio_sid_selected == 0x80 ? 0x81 : 0x80;
 					audio_stream_reset();
@@ -2155,7 +2214,7 @@ int main(int argc, char **argv) {
 	dbg_summary();
 #endif
 	if (ximg) {
-		XDestroyImage(ximg);
+		destroy_ximage();
 	}
 	XFreeGC(dpy, gc);
 	XDestroyWindow(dpy, win);

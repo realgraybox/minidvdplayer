@@ -38,6 +38,11 @@ Timing diagnostics (new timing only):
     MINIDVD_DEBUG=1 minidvd /dev/dvd    # summary on exit (q)
     MINIDVD_DEBUG=2 minidvd /dev/dvd    # also one line per frame
     MINIDVD_XSYNC=1 minidvd /dev/dvd    # wait for the X server after every frame
+    MINIDVD_NOSHM=1 minidvd /dev/dvd    # don't use MIT-SHM (shared memory) for drawing
+
+Frames are handed to X through shared memory (MIT-SHM) when the X server
+supports it, which is much cheaper than sending them through the X socket;
+otherwise minidvd falls back to plain XPutImage. Building needs libXext.
 
 ## Usage
 
