@@ -76,7 +76,7 @@
 // server to finish each frame (XSync instead of XFlush).
 static struct {
     int level, xsync;
-    long frames, drops, slow_draws, slow_reads, blocks;
+    long frames, drops, slow_draws, slow_reads, blocks, read_errors, blocks_skipped;
     double iv_sum, iv_sq, late_sum, late_max, draw_sum, draw_max;
     double dec_sum, dec_max, rd_max, rd_frame_max, dec_frame;
     double wait_ms, wait_sum, wait_max;  // waiting for the X server (in draw)
@@ -868,6 +868,7 @@ static __attribute__((unused)) int64_t now_us(void) {
 // Without an IFO (or a broken one) the whole VOB is played as one piece
 // and time is estimated from the measured bitrate.
 static int read_block(uint32_t lba, uint8_t *b);
+static void osd_message(const char *text);
 #define MAX_TCELLS 1024
 typedef struct {
     uint32_t first, last;                 // sectors (inclusive)
@@ -1038,7 +1039,29 @@ static int read_title_block(uint8_t *b) {
     } else if (dvd_block >= total_blocks) {
         return 0;
     }
-    return read_block(dvd_block++, b);
+    {
+        // Unreadable sector (scratch, copy protection): the drive may retry
+        // each bad sector for seconds, so skip ahead in growing steps
+        // (16, 32, ... 1024 blocks) until reading works again.
+        static uint32_t err_step = 0;
+        static int64_t last_msg_us = 0;
+        uint32_t lba = dvd_block++;
+        int r = read_block(lba, b);
+        if (r == 1) {
+            err_step = 0;
+            return 1;
+        }
+        err_step = err_step ? (err_step < 1024 ? err_step * 2 : 1024) : 16;
+        dvd_block += err_step;
+        dbg.read_errors++;
+        dbg.blocks_skipped += err_step;
+        fprintf(stderr, "Read error at block %u, skipping %u blocks\n", lba, err_step);
+        if (now_us() - last_msg_us > 1000000) {
+            last_msg_us = now_us();
+            osd_message("Read error, skipping");
+        }
+        return 0;
+    }
 }
 
 static int at_title_end(void) {
@@ -2077,7 +2100,12 @@ static void new_sequence(void) {
 
 #ifdef TEST_PLAIN_VOB
 static int vob_fd = -1;
+static uint32_t test_bad_first = 1, test_bad_last = 0;   // MINIDVD_TEST_BAD="first-last"
 static int read_block(uint32_t lba, uint8_t *b) {
+    if (lba >= test_bad_first && lba <= test_bad_last) {
+        usleep(300000);                   // a bad sector takes the drive a while
+        return 0;
+    }
     return pread(vob_fd, b, 2048, (off_t)lba * 2048) == 2048 ? 1 : 0;
 }
 #else
@@ -2375,6 +2403,12 @@ static int decode_next_frame(void) {
                 const mpeg2_picture_t *pic = info->display_picture;
                 if (info->sequence && info->sequence->frame_period)
                     frame_dur = info->sequence->frame_period / 300;   // 27 MHz -> 90 kHz
+                const mpeg2_picture_t *pic2 = info->display_picture_2nd;
+                // field-coded video: the frame's two fields come as two
+                // pictures (nb_fields 1 each); the second field may carry the tag
+                unsigned int fields = pic->nb_fields + (pic2 ? pic2->nb_fields : 0);
+                if (!(pic->flags & PIC_FLAG_TAGS) && pic2 && (pic2->flags & PIC_FLAG_TAGS))
+                    pic = pic2;
                 if (pic->flags & PIC_FLAG_TAGS) {
                     frame_pts = ((int64_t)pic->tag2 << 32) | pic->tag;
                     if (vid_next_pts != PTS_NONE &&
@@ -2384,7 +2418,7 @@ static int decode_next_frame(void) {
                     frame_pts = vid_next_pts;                         // extrapolate
                 }
                 if (frame_pts != PTS_NONE)
-                    vid_next_pts = frame_pts + frame_dur * pic->nb_fields / 2;
+                    vid_next_pts = frame_pts + frame_dur * fields / 2;
                 frame_ready = 1;
                 return 1;
             }
@@ -2474,8 +2508,8 @@ static void dbg_summary(void) {
             dbg.wait_sum / dbg.frames, dbg.wait_max);
     fprintf(stderr, "decode per frame (ms): avg %.1f max %.1f\n",
             dbg.dec_sum / dbg.frames, dbg.dec_max);
-    fprintf(stderr, "disc reads: %ld blocks, slowest %.1f ms, >20ms: %ld\n",
-            dbg.blocks, dbg.rd_max, dbg.slow_reads);
+    fprintf(stderr, "disc reads: %ld blocks, slowest %.1f ms, >20ms: %ld, read errors %ld (%ld blocks skipped)\n",
+            dbg.blocks, dbg.rd_max, dbg.slow_reads, dbg.read_errors, dbg.blocks_skipped);
     fprintf(stderr, "audio delay reported (frames): min %d max %d, starved %ld\n",
             dbg.adly_max < 0 ? -1 : dbg.adly_min, dbg.adly_max, dbg.starved);
     fprintf(stderr, "clock: forward >2ms %ld (avg %.1f, max %.1f ms), pulled back %ld (avg %.1f ms)\n",
@@ -2700,6 +2734,13 @@ int main(int argc, char **argv) {
 
 #ifdef TEST_PLAIN_VOB
 	if (getenv("MINIDVD_TEST_CELLS")) title_map_from_string(getenv("MINIDVD_TEST_CELLS"));
+	if (getenv("MINIDVD_TEST_BAD")) {
+		unsigned long a = 0, b = 0;
+		if (sscanf(getenv("MINIDVD_TEST_BAD"), "%lu-%lu", &a, &b) == 2) {
+			test_bad_first = a;
+			test_bad_last = b;
+		}
+	}
 #else
 	if (!title_map_from_ifo(ifo))
 		fprintf(stderr, "Title: no usable program chain, playing the whole title set\n");

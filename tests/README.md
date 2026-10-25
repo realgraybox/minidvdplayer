@@ -21,6 +21,9 @@ Test-only compile flags (never used for normal builds):
   VOB, to test skip-to-film, cell following and the jump keys. Test actions
   `jump:<secs>` and `chap:+1|-1` press the arrow keys, `sub` and `subtoggle`
   press `n` and `s`.
+- `MINIDVD_TEST_BAD="first-last"` (with `TEST_PLAIN_VOB`): those blocks fail
+  to read (after 300 ms each, like a bad sector) to test skipping damaged
+  areas.
 
 Files:
 
@@ -32,6 +35,8 @@ Files:
 - `run_av_test.sh [old]`: generate a test VOB, build, play, print stats
 - `av_analyze.py log...`: frame interval and A/V offset statistics
 - `av_buckets.py log [seconds]`: the same, per second of playback
+- `strip_pts.py in.vob out.vob N`: keep the video timestamp only on every
+  Nth picture (discs that only stamp the first picture of a GOP)
 - `add_test_subs.py in.vob out.vob`: insert two DVD subtitle packets
   (pts 3.54 s and 10.54 s) into the test VOB
 
