@@ -150,6 +150,80 @@ int main(void) {
     assert(next_series_title(1) == 2 && next_series_title(3) == 4 && next_series_title(4) == -1);
     assert(next_series_title(0) == 1);    // after the extra: the episodes
 
+    // ---- copy protection: the film plus decoy versions of it ----
+    // real film: 28 cells; decoys reuse them and add junk cells of their own
+    {
+        static cell_playback_t pc[4][40];
+        static pgc_t pp[14];
+        static pgci_srp_t psrp[14];
+        static pgcit_t ppgcit;
+        static ptt_info_t pptt[14];
+        static ttu_t pttu[14];
+        static vts_ptt_srpt_t pptts;
+        static vtsi_mat_t pmat;
+        static ifo_handle_t pvts, pvmg;
+        static title_info_t pti[14];
+        static tt_srpt_t ptt;
+        // real cells: 28 x 70000 sectors from 0; junk cells from 3000000
+        int n[4] = { 0, 0, 0, 0 };
+        uint32_t junk = 3000000;
+        #define CELL(t, first, last, sec) do { cell_playback_t *c_ = &pc[t][n[t]++]; \
+            *c_ = (cell_playback_t){0}; c_->first_sector = (first); c_->last_sector = (last); \
+            c_->playback_time = T(0, (sec) / 60, (sec) % 60, 0); } while (0)
+        for (int r = 0; r < 28; r++) {
+            CELL(0, r * 70000, r * 70000 + 69999, 216);                      // film
+            CELL(1, r * 70000, r * 70000 + 69999, 216);                      // decoy A
+            if (r % 5 == 2) { CELL(1, junk, junk + 4999, 36); junk += 5000; } //   + junk
+            CELL(2, r * 70000, r * 70000 + 69999, 216);                      // decoy B
+            if (r == 10 || r == 20) { CELL(2, junk, junk + 999, 1); junk += 1000; }
+            if (r < 25) CELL(3, r * 70000, r * 70000 + 69999, 216);          // decoy C
+        }
+        CELL(3, junk, junk + 2999, 20); junk += 3000;
+        #undef CELL
+        static const int lens[4][3] = { {1,40,48}, {1,44,24}, {1,40,50}, {1,30,20} };
+        for (int t = 0; t < 4; t++) {
+            pp[t] = (pgc_t){0};
+            pp[t].nr_of_cells = n[t]; pp[t].cell_playback = pc[t];
+            pp[t].playback_time = T(lens[t][0], lens[t][1], lens[t][2], 0);
+        }
+        // 9 short extras in their own area
+        static cell_playback_t xc[9];
+        for (int x = 0; x < 9; x++) {
+            xc[x] = (cell_playback_t){0};
+            xc[x].first_sector = 4000000 + x * 50000; xc[x].last_sector = xc[x].first_sector + 39999;
+            xc[x].playback_time = T(0, 2, 0, 0);
+            pp[4 + x] = (pgc_t){0};
+            pp[4 + x].nr_of_cells = 1; pp[4 + x].cell_playback = &xc[x];
+            pp[4 + x].playback_time = xc[x].playback_time;
+        }
+        for (int i = 0; i < 13; i++) {
+            psrp[i].pgc = &pp[i];
+            pptt[i].pgcn = i + 1; pptt[i].pgn = 1;
+            pttu[i].nr_of_ptts = 1; pttu[i].ptt = &pptt[i];
+        }
+        ppgcit.nr_of_pgci_srp = 13; ppgcit.pgci_srp = psrp;
+        pptts.nr_of_srpts = 13; pptts.title = pttu;
+        pvts.vts_pgcit = &ppgcit; pvts.vts_ptt_srpt = &pptts; pvts.vtsi_mat = &pmat;
+        vts_ifo[1] = &pvts;
+        vts_blocks[1] = 5000000;
+        // title table like the user's disc: film first, extras, decoys last
+        static const int porder[13] = { 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 2, 3, 4 };
+        for (int i = 0; i < 13; i++) {
+            pti[i] = (title_info_t){0};
+            pti[i].title_set_nr = 1; pti[i].vts_ttn = porder[i]; pti[i].nr_of_ptts = 18;
+        }
+        ptt.nr_of_srpts = 13; ptt.title = pti;
+        pvmg.tt_srpt = &ptt;
+        ntitles = 0;
+        titles_from_vmg(&pvmg);
+        int pstart = titles_choose(1);
+        titles_print(pstart);
+        assert(ntitles == 13);
+        assert(pstart == 0);                              // the real film (title 1)
+        assert(!series && next_series_title(0) == -1);    // no play-on into decoys
+        assert(titles[10].version_of == 0 && titles[11].version_of == 0 && titles[12].version_of == 0);
+    }
+
     // a movie disc: one long title + extras -> no series, start at the film
     ntitles = 0;
     titles[ntitles++] = (dvdtitle_t){ 1, 1, NULL, 6300, 20 };

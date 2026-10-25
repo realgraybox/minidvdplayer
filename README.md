@@ -55,7 +55,10 @@ minidvd plays the main title (the longest title in the largest title set),
 cell by cell, so logos and extras outside the film are skipped. Its chapters
 and cell times are used for the jump keys below. On series discs (at least
 three titles of similar length, e.g. episodes) playback starts at the first
-of them and continues through the others in disc order. PgUp/PgDn go to the
+of them and continues through the others in disc order. Titles of similar
+length that share most of their disc sectors are versions of one film (e.g.
+copy protection decoys, which add unreadable cells), not episodes: minidvd
+plays the version with the fewest sectors of its own. PgUp/PgDn go to the
 previous/next title. The titles are listed at startup. If the disc has no
 usable title information, the whole title set is played and jumps are
 estimated from the bitrate.
