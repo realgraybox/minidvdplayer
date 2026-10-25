@@ -12,6 +12,7 @@
 #include <limits.h>
 #include <sys/time.h>
 #include <time.h>
+#include <ctype.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -122,6 +123,7 @@ static int dst_h = 0;
 
 //audio output globals
 static int audio_active = 0;	// stream activity
+static __attribute__((unused)) int audio_switch_fill = 0;  // audio stream changed: fill the gap
 
 static int audio_rate = 48000;     // output rate
 static int audio_channels = 2;     // output channels (stereo downmix)
@@ -788,7 +790,7 @@ static const struct help_entry help_entries[] = {
     { "Shift + a",   "Previous audio stream" },    
     { "f",           "Fullscreen" },
     { "h",           "Toggle help" },
-    { "n",           "Next subtitle stream" },
+    { "n",           "Next subtitle stream (on)" },
     { "Shift + n",   "Previous subtitle stream" },    
     { "s",           "Toggle subtitle ON/OFF" },
     { "q / Esc",     "Quit" },
@@ -877,6 +879,9 @@ static double tchap[256];                 // chapter start times
 static int ntchap = 0;
 static double title_len = 0;              // seconds (map) or estimate (linear)
 static int cur_cell = 0;                  // cell being read
+#ifndef TEST_PLAIN_VOB
+static pgc_t *main_pgc = NULL;            // main title's program chain
+#endif
 static int title_done = 0;                // past the last cell
 static double linear_bps = 400.0;         // blocks/s estimate (linear mode)
 
@@ -887,7 +892,7 @@ static double seek_target_time = 0;       // last requested target (held keys ad
 static int seek_target_cell = 0;
 
 // on-screen position text
-static char osd_text[96];
+static char osd_text[160];
 static int64_t osd_until_us = 0;
 
 static __attribute__((unused)) double dvdtime_sec(const dvd_time_t *t) {
@@ -931,6 +936,7 @@ static int title_map_from_ifo(ifo_handle_t *ifo) {
         if (len > best_len) { best_len = len; best = pgc; best_i = i; }
     }
     if (!best) return 0;
+    main_pgc = best;                      // also used for the stream lists
 
     title_map_reset();
     for (int c = 0; c < best->nr_of_cells; c++) {
@@ -1080,6 +1086,218 @@ static void draw_osd(void) {
     XFillRectangle(dpy, win, gc, 10, 10, w, 20);
     XSetForeground(dpy, gc, WhitePixel(dpy, DefaultScreen(dpy)));
     XDrawString(dpy, win, gc, 14, 25, osd_text, strlen(osd_text));
+}
+
+// ------------------ audio / subtitle streams ------------------
+// With an IFO, the main title's stream tables say which audio and
+// subtitle streams exist, their language and kind; 'a' and 'n' cycle
+// through those only. Without one, they cycle through the streams seen
+// in the data so far.
+static char audio_name[8][112];            // per audio_sid_list entry
+static char sub_name[32][96];             // per sub_sid_list entry
+static int streams_known = 0;             // lists come from the IFO
+static uint8_t seen_audio = 0;            // bit n: sid 0x80+n seen
+static uint32_t seen_sub = 0;             // bit n: sid 0x20+n seen
+static void audio_stream_reset(void);
+
+static const struct { char code[3]; const char *name; } lang_names[] = {
+    {"da","Danish"}, {"en","English"}, {"de","German"}, {"fr","French"},
+    {"es","Spanish"}, {"it","Italian"}, {"nl","Dutch"}, {"sv","Swedish"},
+    {"no","Norwegian"}, {"nb","Norwegian"}, {"nn","Norwegian"}, {"fi","Finnish"},
+    {"is","Icelandic"}, {"fo","Faroese"}, {"pl","Polish"}, {"pt","Portuguese"},
+    {"ru","Russian"}, {"uk","Ukrainian"}, {"cs","Czech"}, {"sk","Slovak"},
+    {"hu","Hungarian"}, {"ro","Romanian"}, {"bg","Bulgarian"}, {"hr","Croatian"},
+    {"sr","Serbian"}, {"sl","Slovenian"}, {"et","Estonian"}, {"lv","Latvian"},
+    {"lt","Lithuanian"}, {"el","Greek"}, {"tr","Turkish"}, {"he","Hebrew"},
+    {"iw","Hebrew"}, {"ar","Arabic"}, {"fa","Persian"}, {"hi","Hindi"},
+    {"th","Thai"}, {"vi","Vietnamese"}, {"id","Indonesian"}, {"ms","Malay"},
+    {"zh","Chinese"}, {"ja","Japanese"}, {"ko","Korean"}, {"ca","Catalan"},
+    {"eu","Basque"}, {"gl","Galician"}, {"ga","Irish"}, {"cy","Welsh"},
+    {"la","Latin"}, {"sq","Albanian"}, {"mk","Macedonian"}, {"bs","Bosnian"},
+};
+
+static __attribute__((unused)) void lang_name(char *out, size_t n, int has_lang, uint16_t code) {
+    char c[3] = { (char)tolower(code >> 8), (char)tolower(code & 0xFF), 0 };
+    if (!has_lang || !isalpha((unsigned char)c[0]) || !isalpha((unsigned char)c[1])) {
+        snprintf(out, n, "Unknown language");
+        return;
+    }
+    for (size_t i = 0; i < sizeof(lang_names) / sizeof(lang_names[0]); i++)
+        if (!strcmp(lang_names[i].code, c)) { snprintf(out, n, "%s", lang_names[i].name); return; }
+    snprintf(out, n, "%s", c);            // unknown code: show it as is
+}
+
+static void osd_message(const char *text) {
+    snprintf(osd_text, sizeof(osd_text), "%s", text);
+    osd_until_us = now_us() + 2000000;
+    need_redraw = 1;
+    fprintf(stderr, "%s\n", osd_text);
+}
+
+#ifndef TEST_PLAIN_VOB
+static const char *audio_kind(int ext) {
+    switch (ext) {
+    case 2: return ", visually impaired";
+    case 3: return ", director's comments";
+    case 4: return ", alt. director's comments";
+    default: return "";
+    }
+}
+
+static const char *sub_kind(int ext) {
+    switch (ext) {
+    case 2: return ", large";
+    case 3: return ", children";
+    case 5: return ", captions";
+    case 6: return ", large captions";
+    case 7: return ", children's captions";
+    case 9: return ", forced";
+    case 13: return ", director's comments";
+    case 14: return ", large director's comments";
+    case 15: return ", children's director's comments";
+    default: return "";
+    }
+}
+
+// Stream lists from the title set's IFO and the main title's program chain
+// (pgc may be NULL: then all streams of the title set, in order).
+static void streams_from_ifo(ifo_handle_t *ifo, pgc_t *pgc) {
+    vtsi_mat_t *m = ifo ? ifo->vtsi_mat : NULL;
+    int na = 0, ns = 0, wide;
+    if (!m) return;
+    wide = m->vts_video_attr.display_aspect_ratio == 3;   // 16:9
+
+    for (int i = 0; i < 8; i++) {
+        audio_attr_t *a = &m->vts_audio_attr[i];
+        int phys;
+        char lang[32], fmt[24];
+        if (pgc) {
+            if (!(pgc->audio_control[i] & 0x8000)) continue;   // not in this title
+            phys = (pgc->audio_control[i] >> 8) & 7;
+        } else {
+            if (i >= m->nr_of_vts_audio_streams) continue;
+            phys = i;
+        }
+        lang_name(lang, sizeof(lang), a->lang_type == 1, a->lang_code);
+        if (a->audio_format != 0) {       // only AC3 can be played
+            static const char *f[8] = { "AC3", "?", "MPEG-1", "MPEG-2", "LPCM", "?", "DTS", "?" };
+            fprintf(stderr, "Audio: %s %s not supported, skipped\n", lang, f[a->audio_format & 7]);
+            continue;
+        }
+        if (a->channels + 1 == 6) snprintf(fmt, sizeof(fmt), "AC3 5.1");
+        else if (a->channels + 1 == 2) snprintf(fmt, sizeof(fmt), "AC3 stereo");
+        else if (a->channels + 1 == 1) snprintf(fmt, sizeof(fmt), "AC3 mono");
+        else snprintf(fmt, sizeof(fmt), "AC3 %d ch", a->channels + 1);
+        audio_sid_list[na] = 0x80 + phys;
+        snprintf(audio_name[na], sizeof(audio_name[na]), "%s, %s%s",
+                 lang, fmt, a->lang_type == 1 ? audio_kind(a->lang_extension) : "");
+        na++;
+    }
+    for (int i = 0; i < 32; i++) {
+        subp_attr_t *sp = &m->vts_subp_attr[i];
+        int phys;
+        char lang[32];
+        if (pgc) {
+            uint32_t ctl = pgc->subp_control[i];
+            if (!(ctl & 0x80000000)) continue;
+            phys = wide ? (ctl >> 16) & 0x1F : (ctl >> 24) & 0x1F;
+        } else {
+            if (i >= m->nr_of_vts_subp_streams) continue;
+            phys = i;
+        }
+        lang_name(lang, sizeof(lang), sp->type == 1, sp->lang_code);
+        sub_sid_list[ns] = 0x20 + phys;
+        snprintf(sub_name[ns], sizeof(sub_name[ns]), "%s%s",
+                 lang, sp->type == 1 ? sub_kind(sp->lang_extension) : "");
+        ns++;
+    }
+    if (!na && !ns) return;               // nothing usable: keep the fallback
+    audio_count = na;
+    sub_count = ns;
+    streams_known = 1;
+    for (int i = 0; i < na; i++)
+        fprintf(stderr, "Audio %d: %s\n", i + 1, audio_name[i]);
+    for (int i = 0; i < ns; i++)
+        fprintf(stderr, "Subtitles %d: %s\n", i + 1, sub_name[i]);
+}
+#endif
+
+// fallback lists: the streams seen in the data so far
+static void streams_from_seen(void) {
+    if (streams_known) return;
+    audio_count = 0;
+    for (int i = 0; i < 8; i++)
+        if (seen_audio & (1u << i)) {
+            audio_sid_list[audio_count] = 0x80 + i;
+            snprintf(audio_name[audio_count], sizeof(audio_name[0]), "stream %d", i + 1);
+            audio_count++;
+        }
+    sub_count = 0;
+    for (int i = 0; i < 32; i++)
+        if (seen_sub & (1u << i)) {
+            sub_sid_list[sub_count] = 0x20 + i;
+            snprintf(sub_name[sub_count], sizeof(sub_name[0]), "stream %d", i + 1);
+            sub_count++;
+        }
+}
+
+static int stream_index(const uint8_t *list, int count, int sid) {
+    for (int i = 0; i < count; i++)
+        if (list[i] == sid) return i;
+    return -1;
+}
+
+static void audio_select(int dir) {
+    char msg[160];
+    int i;
+    streams_from_seen();
+    if (audio_count <= 0) { osd_message("No audio streams"); return; }
+    i = stream_index(audio_sid_list, audio_count, audio_sid_selected);
+    if (i < 0) i = 0;
+    else if (audio_count > 1) i = (i + dir + audio_count) % audio_count;
+    if (audio_sid_list[i] != audio_sid_selected) {
+        audio_sid_selected = audio_sid_list[i];
+        audio_stream_reset();
+#ifndef SYNC_OLD
+        audio_switch_fill = 1;
+#endif
+        audio_active = 1;                 // optimistic
+        audio_bytes = 0;
+        last_audio_bytes = 0;
+    }
+    snprintf(msg, sizeof(msg), "Audio %d/%d: %s", i + 1, audio_count, audio_name[i]);
+    osd_message(msg);
+}
+
+static void sub_show_state(void) {
+    char msg[160];
+    int i = stream_index(sub_sid_list, sub_count, current_sub_sid);
+    if (!subtitle_enabled || i < 0)
+        snprintf(msg, sizeof(msg), sub_count ? "Subtitles off" : "No subtitles");
+    else
+        snprintf(msg, sizeof(msg), "Subtitles %d/%d: %s", i + 1, sub_count, sub_name[i]);
+    osd_message(msg);
+}
+
+static void sub_select(int dir) {
+    int i;
+    streams_from_seen();
+    if (sub_count <= 0) { osd_message("No subtitles"); return; }
+    i = stream_index(sub_sid_list, sub_count, current_sub_sid);
+    if (i < 0) i = 0;
+    else if (subtitle_enabled) i = (i + dir + sub_count) % sub_count;
+    current_sub_sid = sub_sid_list[i];
+    subtitle_enabled = 1;                 // choosing a stream turns them on
+    sub_valid = 0;                        // drop the old stream's subtitle
+    sub_show_state();
+}
+
+static void sub_toggle(void) {
+    streams_from_seen();
+    subtitle_enabled = !subtitle_enabled;
+    if (subtitle_enabled && stream_index(sub_sid_list, sub_count, current_sub_sid) < 0 && sub_count)
+        current_sub_sid = sub_sid_list[0];
+    sub_show_state();
 }
 
 static void request_seek_time(double t) {
@@ -1504,9 +1722,32 @@ typedef struct {
 static spu_assembler_t spu[0x20];   // one per substream (0x20–0x3F)
 
 // helpers
+#ifndef SYNC_OLD
+static int64_t clock_now(void);
+#endif
+
 static void audio_feed(uint8_t *data, int len, void *opaque) {
 	if (!audio_enabled || audio_type != AUDIO_AC3) { return;}
 	audio_bytes += len;
+#ifndef SYNC_OLD
+	// After an audio stream change the new stream's data starts where the
+	// reader is (up to ~0.7 s ahead of the picture). Fill the gap with
+	// silence so the new audio lines up with the picture and the clock
+	// does not jump (which made the video skip ahead).
+	if (audio_switch_fill && ac3_frame_pts != PTS_NONE && aq_end_pts == PTS_NONE) {
+		int64_t now = clock_now();
+		audio_switch_fill = 0;
+		if (now != PTS_NONE && ac3_frame_pts > now && ac3_frame_pts - now < 3 * PTS_HZ) {
+			static const int16_t zeros[2 * 1024];
+			int frames = (int)((ac3_frame_pts - now) * audio_rate / PTS_HZ);
+			while (frames > 0) {
+				int n = frames > 1024 ? 1024 : frames;
+				aq_push(zeros, n);
+				frames -= n;
+			}
+		}
+	}
+#endif
 	if (ac3_frame_pts != PTS_NONE) { aq_end_pts = ac3_frame_pts;}
     int flags = A52_STEREO;
     sample_t level = 1.0;
@@ -1649,6 +1890,8 @@ static void demux_ps(uint8_t *buf, int len) {
                 // Private stream 1 (audio/subtitle)
                 if (payload_len < 1) goto next_packet;
                 uint8_t sid = buf[payload_start];
+                if (sid >= 0x80 && sid <= 0x87) seen_audio |= 1u << (sid - 0x80);
+                else if (sid >= 0x20 && sid <= 0x3F) seen_sub |= 1u << (sid - 0x20);
                 // Audio detection
                 if (!audio_checked) {
                     audio_checked = 1;
@@ -2460,6 +2703,11 @@ int main(int argc, char **argv) {
 #else
 	if (!title_map_from_ifo(ifo))
 		fprintf(stderr, "Title: no usable program chain, playing the whole title set\n");
+	streams_from_ifo(ifo, main_pgc);
+	if (streams_known) {                  // first listed streams (subtitles on, as before)
+		audio_sid_selected = audio_count ? audio_sid_list[0] : 0x80;
+		current_sub_sid = sub_count ? sub_sid_list[0] : -1;
+	}
 #endif
 	title_start();                        // first cell of the film
 	mpeg2 = mpeg2_init();
@@ -2497,7 +2745,7 @@ int main(int argc, char **argv) {
 	while (running) {
 		if (sigint_received) { running = 0; break; }
 #ifdef TEST_PLAIN_VOB
-		{   // test script: MINIDVD_TEST="sec:seek:frac,sec:audio,sec:pause:secs,sec:size:WxH,sec:help,sec:jump:secs,sec:chap:+1|-1"
+		{   // test script: MINIDVD_TEST="sec:seek:frac,sec:audio,sec:sub,sec:subtoggle,sec:pause:secs,sec:size:WxH,sec:help,sec:jump:secs,sec:chap:+1|-1"
 			static const char *ts = NULL;
 			static int64_t t_start, unpause_at;
 			int64_t el;
@@ -2517,11 +2765,9 @@ int main(int argc, char **argv) {
 					int w = atoi(a + 5), h = strchr(a, 'x') ? atoi(strchr(a, 'x') + 1) : 0;
 					if (w > 0 && h > 0) XResizeWindow(dpy, win, w, h);
 				}
-				else if (!strncmp(a, "audio", 5)) {
-					audio_sid_selected = audio_sid_selected == 0x80 ? 0x81 : 0x80;
-					audio_stream_reset();
-					audio_active = 1; audio_bytes = 0; last_audio_bytes = 0;
-				}
+				else if (!strncmp(a, "audio", 5)) audio_select(1);
+				else if (!strncmp(a, "subtoggle", 9)) sub_toggle();
+				else if (!strncmp(a, "sub", 3)) sub_select(1);
 				ts = strchr(ts, ',');
 				ts = ts ? ts + 1 : "";
 			}
@@ -2575,30 +2821,9 @@ int main(int argc, char **argv) {
 					}
 					need_redraw = 1;
 					break;
-				} else if (ks == XK_a && audio_count > 0) {
-					if (audio_type == AUDIO_AC3) {
-						int backwards = (ev.xkey.state & ShiftMask);
-						int idx = 0;
-
-						if (audio_sid_selected >= 0) {
-							for (int i = 0; i < audio_count; i++) {
-								if (audio_sid_list[i] == audio_sid_selected) {
-									if (backwards)   // backward
-										idx = (i - 1 + audio_count) % audio_count;
-									else              // forward
-										idx = (i + 1) % audio_count;
-									break;
-								}
-							}
-						}
-						audio_sid_selected = audio_sid_list[idx];
-						audio_stream_reset();
-						audio_active = 1;      // optimistic
-						audio_bytes = 0;
-						last_audio_bytes = 0;
-						fprintf(stderr, "Audio: sid=0x%02x\n", audio_sid_selected);
-					}
-					break;	
+				} else if (ks == XK_a) {
+					audio_select((ev.xkey.state & ShiftMask) ? -1 : 1);
+					break;
 				} else if (ks == XK_m) {
 					audio_muted = !audio_muted;
 					fprintf(stderr, "Mute: %s\n", audio_muted ? "on" : "off");
@@ -2621,25 +2846,10 @@ int main(int argc, char **argv) {
 					need_redraw = 1;
 					break;
 				} else if (ks == XK_s) {	// toggle subtitle ON/OFF
-					subtitle_enabled = !subtitle_enabled;
-					fprintf(stderr, "Subtitles: %s\n", subtitle_enabled ? "on" : "off");
+					sub_toggle();
 					break;
-				} else if (ks == XK_n && sub_count > 0) {	// next subtitle stream / language
-					int backwards = (ev.xkey.state & ShiftMask);
-					int idx = 0;
-					if (current_sub_sid >= 0) {
-						for (int i = 0; i < sub_count; i++) {
-							if (sub_sid_list[i] == current_sub_sid) {
-								if (backwards)   // backward
-									idx = (i - 1 + sub_count) % sub_count;
-								else              // forward
-									idx = (i + 1) % sub_count;
-								break;
-							}
-						}
-					}
-					current_sub_sid = sub_sid_list[idx];
-					fprintf(stderr, "Subtitle: sid=0x%02x\n", current_sub_sid);	
+				} else if (ks == XK_n) {	// next / previous subtitle stream
+					sub_select((ev.xkey.state & ShiftMask) ? -1 : 1);
 					break;
 				} else if (ks == XK_f) {
 					show_help = 0;
