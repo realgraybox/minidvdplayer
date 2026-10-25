@@ -785,6 +785,7 @@ static const struct help_entry help_entries[] = {
     { "Left/Right",  "Back / forward 10 s" },
     { "Down/Up",     "Back / forward 1 min" },
     { "Shift+L/R",   "Previous / next chapter" },
+    { "PgUp/PgDn",   "Previous / next title" },
     { "Mouse click", "Seek within title" },
     { "a",           "Next audio stream" },
     { "Shift + a",   "Previous audio stream" },    
@@ -920,28 +921,15 @@ static void title_map_reset(void) {
 }
 
 #ifndef TEST_PLAIN_VOB
-// Build the map from the title set's longest program chain. 0 = unusable.
-static int title_map_from_ifo(ifo_handle_t *ifo) {
-    pgcit_t *pgcit = ifo ? ifo->vts_pgcit : NULL;
-    pgc_t *best = NULL;
-    double best_len = 0;
-    int best_i = -1;
+// Build the map from one program chain (pgcn: its number, for the log).
+// 0 = unusable.
+static int title_map_from_pgc(pgc_t *pgc, int pgcn) {
     int cellidx[256];                     // PGC cell number -> our index
 
-    if (!pgcit) return 0;
-    for (int i = 0; i < pgcit->nr_of_pgci_srp; i++) {
-        pgc_t *pgc = pgcit->pgci_srp[i].pgc;
-        double len;
-        if (!pgc || !pgc->nr_of_cells || !pgc->cell_playback) continue;
-        len = dvdtime_sec(&pgc->playback_time);
-        if (len > best_len) { best_len = len; best = pgc; best_i = i; }
-    }
-    if (!best) return 0;
-    main_pgc = best;                      // also used for the stream lists
-
     title_map_reset();
-    for (int c = 0; c < best->nr_of_cells; c++) {
-        cell_playback_t *cp = &best->cell_playback[c];
+    if (!pgc || !pgc->nr_of_cells || !pgc->cell_playback) return 0;
+    for (int c = 0; c < pgc->nr_of_cells; c++) {
+        cell_playback_t *cp = &pgc->cell_playback[c];
         cellidx[c] = ntcells;             // a skipped cell maps to the next one
         // multi-angle block: only the first angle belongs to the timeline
         if (cp->block_type == BLOCK_TYPE_ANGLE_BLOCK &&
@@ -954,16 +942,36 @@ static int title_map_from_ifo(ifo_handle_t *ifo) {
     }
     if (!ntcells || title_len < 1.0) { title_map_reset(); return 0; }
 
-    for (int p = 0; p < best->nr_of_programs && ntchap < 256; p++) {
-        int c = best->program_map ? best->program_map[p] - 1 : -1;
-        if (c < 0 || c >= best->nr_of_cells || cellidx[c] >= ntcells) continue;
+    for (int p = 0; p < pgc->nr_of_programs && ntchap < 256; p++) {
+        int c = pgc->program_map ? pgc->program_map[p] - 1 : -1;
+        if (c < 0 || c >= pgc->nr_of_cells || cellidx[c] >= ntcells) continue;
         if (ntchap && tcells[cellidx[c]].start <= tchap[ntchap - 1]) continue;
         tchap[ntchap++] = tcells[cellidx[c]].start;
     }
     fprintf(stderr, "Title: PGC %d, %d:%02d:%02d, %d chapters, %d cells\n",
-            best_i + 1, (int)title_len / 3600, ((int)title_len / 60) % 60,
+            pgcn, (int)title_len / 3600, ((int)title_len / 60) % 60,
             (int)title_len % 60, ntchap, ntcells);
     return 1;
+}
+
+// Without a usable title table: the title set's longest program chain.
+static int title_map_from_ifo(ifo_handle_t *ifo) {
+    pgcit_t *pgcit = ifo ? ifo->vts_pgcit : NULL;
+    pgc_t *best = NULL;
+    double best_len = 0;
+    int best_i = -1;
+
+    if (!pgcit) return 0;
+    for (int i = 0; i < pgcit->nr_of_pgci_srp; i++) {
+        pgc_t *pgc = pgcit->pgci_srp[i].pgc;
+        double len;
+        if (!pgc || !pgc->nr_of_cells || !pgc->cell_playback) continue;
+        len = dvdtime_sec(&pgc->playback_time);
+        if (len > best_len) { best_len = len; best = pgc; best_i = i; }
+    }
+    if (!best) return 0;
+    main_pgc = best;                      // also used for the stream lists
+    return title_map_from_pgc(best, best_i + 1);
 }
 #endif
 
@@ -1321,6 +1329,187 @@ static void sub_toggle(void) {
     if (subtitle_enabled && stream_index(sub_sid_list, sub_count, current_sub_sid) < 0 && sub_count)
         current_sub_sid = sub_sid_list[0];
     sub_show_state();
+}
+
+// ------------------ titles (episodes) ------------------
+// The disc's title table lists its titles. minidvd starts with the main
+// title (longest title in the largest title set). If at least 3 titles
+// have a similar length (50-150% of it) the disc is treated as a series:
+// playback starts at the first of them and continues through the others
+// in disc order. PgUp/PgDn go to the previous/next title.
+#define MAX_TITLES 99
+typedef struct {
+    int vts, pgcn;                        // title set, program chain
+    const char *cells;                    // test: cell list
+    double len;
+    int chapters;
+} dvdtitle_t;
+static dvdtitle_t titles[MAX_TITLES];
+static int ntitles = 0, cur_title = -1;
+static int series = 0;                    // play on through similar titles
+static double series_ref = 0;             // length of the main title
+static int title_switch_to = -1;          // pending title change
+
+#ifndef TEST_PLAIN_VOB
+static dvd_reader_t *dvd_dev;
+static ifo_handle_t *vts_ifo[100];
+static uint32_t vts_blocks[100];
+static int open_vts = 0;
+
+static ifo_handle_t *vts_ifo_get(int v) {
+    if (v < 1 || v > 99) return NULL;
+    if (!vts_ifo[v]) vts_ifo[v] = ifoOpen(dvd_dev, v);
+    return vts_ifo[v];
+}
+
+static pgc_t *vts_pgc(int v, int pgcn) {
+    ifo_handle_t *ifo = vts_ifo_get(v);
+    if (!ifo || !ifo->vts_pgcit || pgcn < 1 || pgcn > ifo->vts_pgcit->nr_of_pgci_srp)
+        return NULL;
+    return ifo->vts_pgcit->pgci_srp[pgcn - 1].pgc;
+}
+
+// The titles from the title table that look like real video.
+static void titles_from_vmg(ifo_handle_t *vmg) {
+    tt_srpt_t *tt = vmg ? vmg->tt_srpt : NULL;
+    if (!tt || !tt->title) return;
+    for (int i = 0; i < tt->nr_of_srpts && ntitles < MAX_TITLES; i++) {
+        title_info_t *ti = &tt->title[i];
+        int v = ti->title_set_nr, pgcn, dup = 0, ok = 0;
+        ifo_handle_t *ifo;
+        ttu_t *u;
+        pgc_t *pgc;
+        double len, blocks = 0;
+
+        if (v < 1 || v > 99 || !vts_blocks[v]) continue;
+        ifo = vts_ifo_get(v);
+        if (!ifo || !ifo->vts_ptt_srpt || ti->vts_ttn < 1 ||
+            ti->vts_ttn > ifo->vts_ptt_srpt->nr_of_srpts) continue;
+        u = &ifo->vts_ptt_srpt->title[ti->vts_ttn - 1];
+        if (!u->nr_of_ptts || !u->ptt) continue;
+        pgcn = u->ptt[0].pgcn;
+        pgc = vts_pgc(v, pgcn);
+        if (!pgc || !pgc->nr_of_cells || !pgc->cell_playback) continue;
+        len = dvdtime_sec(&pgc->playback_time);
+        for (int c = 0; c < pgc->nr_of_cells; c++) {
+            cell_playback_t *cp = &pgc->cell_playback[c];
+            if (cp->first_sector <= cp->last_sector && cp->last_sector < vts_blocks[v]) {
+                blocks += cp->last_sector - cp->first_sector + 1;
+                ok++;
+            }
+        }
+        // decoys (copy protection), broken entries, still pictures:
+        // no playable cells or far too little data for the claimed length
+        if (len < 5.0 || !ok || blocks / len < 40.0) continue;
+        for (int j = 0; j < ntitles; j++)
+            if (titles[j].vts == v && titles[j].pgcn == pgcn) dup = 1;
+        if (dup) continue;
+        titles[ntitles].vts = v;
+        titles[ntitles].pgcn = pgcn;
+        titles[ntitles].len = len;
+        titles[ntitles].chapters = ti->nr_of_ptts;
+        ntitles++;
+    }
+}
+#endif
+
+static int title_similar(int i) {
+    return titles[i].len >= 0.5 * series_ref && titles[i].len <= 1.5 * series_ref;
+}
+
+static int next_series_title(int cur) {
+    if (!series) return -1;
+    for (int j = cur + 1; j < ntitles; j++)
+        if (title_similar(j)) return j;
+    return -1;
+}
+
+// Pick the start title; largest_vts < 0: longest title.
+static int titles_choose(int largest_vts) {
+    int main_t = -1, group = 0, first = -1;
+    for (int i = 0; i < ntitles; i++)
+        if (titles[i].vts == largest_vts && (main_t < 0 || titles[i].len > titles[main_t].len))
+            main_t = i;
+    if (main_t < 0)
+        for (int i = 0; i < ntitles; i++)
+            if (main_t < 0 || titles[i].len > titles[main_t].len) main_t = i;
+    if (main_t < 0) return -1;
+    series_ref = titles[main_t].len;
+    for (int i = 0; i < ntitles; i++)
+        if (title_similar(i)) { group++; if (first < 0) first = i; }
+    series = group >= 3;
+    return series ? first : main_t;
+}
+
+static void titles_print(int start) {
+    fprintf(stderr, "Titles: %d%s\n", ntitles,
+            series ? " (series: similar titles play in order)" : "");
+    for (int i = 0; i < ntitles; i++) {
+        int t = (int)titles[i].len;
+        fprintf(stderr, "  %c Title %d: %d:%02d:%02d, %d chapters\n",
+                i == start ? '>' : (series && title_similar(i) ? '*' : ' '),
+                i + 1, t / 3600, (t / 60) % 60, t % 60, titles[i].chapters);
+    }
+}
+
+// Make title i the current one (called with playback stopped/reset).
+static int title_load(int i, int keep_streams) {
+    int old_a = audio_sid_selected, old_s = current_sub_sid;
+#ifdef TEST_PLAIN_VOB
+    title_map_from_string(titles[i].cells);
+    (void)old_a; (void)old_s; (void)keep_streams;
+#else
+    int v = titles[i].vts;
+    pgc_t *pgc;
+    if (v != open_vts) {
+        if (vob) DVDCloseFile(vob);
+        vob = DVDOpenFile(dvd_dev, v, DVD_READ_TITLE_VOBS);
+        if (!vob) { fprintf(stderr, "Title %d: cannot open title set %d\n", i + 1, v); return 0; }
+        total_blocks = DVDFileSize(vob);
+        open_vts = v;
+    }
+    pgc = vts_pgc(v, titles[i].pgcn);
+    main_pgc = pgc;
+    if (!title_map_from_pgc(pgc, titles[i].pgcn))
+        fprintf(stderr, "Title %d: no usable cells, playing the whole title set\n", i + 1);
+    streams_known = 0;
+    streams_from_ifo(vts_ifo_get(v), pgc);
+    if (streams_known) {
+        // same language as before if this title has it, else the first one
+        if (!keep_streams || stream_index(audio_sid_list, audio_count, old_a) < 0)
+            audio_sid_selected = audio_count ? audio_sid_list[0] : 0x80;
+        if (!keep_streams || stream_index(sub_sid_list, sub_count, old_s) < 0)
+            current_sub_sid = sub_count ? sub_sid_list[0] : -1;
+    }
+#endif
+    cur_title = i;
+    title_start();
+    return 1;
+}
+
+static void title_request(int i) {
+    char msg[96];
+    int t;
+    if (i < 0 || i >= ntitles) return;
+    title_switch_to = i;
+    t = (int)titles[i].len;
+    snprintf(msg, sizeof(msg), "Title %d/%d   %d:%02d:%02d", i + 1, ntitles,
+             t / 3600, (t / 60) % 60, t % 60);
+    osd_message(msg);
+}
+
+static void title_step(int dir) {
+    int base = title_switch_to >= 0 ? title_switch_to : cur_title;
+    if (ntitles < 2) { osd_message("Only one title"); return; }
+    if (base + dir >= 0 && base + dir < ntitles) title_request(base + dir);
+}
+
+// end of the current title: next episode, or stop
+static int title_play_on(void) {
+    int nx = next_series_title(cur_title);
+    if (nx < 0) return 0;
+    title_request(nx);
+    return 1;
 }
 
 static void request_seek_time(double t) {
@@ -2137,7 +2326,18 @@ static void av_test_log(int64_t pts, int dropped) {
 
 #ifdef SYNC_OLD
 static void playback_step(void) {
-	if (at_title_end()) { running = 0; return; }
+	if (title_switch_to >= 0) {           // next/previous title (episode)
+		int i = title_switch_to;
+		title_switch_to = -1;
+		seek_pending = 0;
+		audio_flush();
+		title_load(i, 1);
+		return;
+	}
+	if (at_title_end()) {                 // next episode, or the end
+		if (!title_play_on()) running = 0;
+		return;
+	}
 	static struct timespec pacemaker_tid;
 	static int pacemaker_initialiseret = 0;
 	
@@ -2558,6 +2758,14 @@ static void playback_step(void) {
     int busy = 0;
     int64_t t = now_us();
 
+    if (title_switch_to >= 0) {           // next/previous title (episode)
+        int i = title_switch_to;
+        title_switch_to = -1;
+        seek_pending = 0;
+        av_reset();
+        title_load(i, 1);
+        return;
+    }
     if (seek_pending) {
         seek_apply();
         av_reset();
@@ -2672,7 +2880,7 @@ static void playback_step(void) {
         }
     } else if (!busy) {
         if (at_title_end() && vq_count == 0) {
-            running = 0;                      // end of title
+            if (!title_play_on()) running = 0;    // next episode, or the end
             return;
         }
         sleep_us(5000);
@@ -2692,21 +2900,22 @@ int main(int argc, char **argv) {
     current_sub_sid = sub_sid_list[0];
     audio_sid_selected = 0x80;
 #else
-    dvd_reader_t *dvd = DVDOpen(argv[1]);
-    if (!dvd) {return 1;}
+    dvd_dev = DVDOpen(argv[1]);
+    if (!dvd_dev) {return 1;}
 	//find largest VTS
     int best_vts = -1;
 	int best_blocks = 0;
 
-	ifo_handle_t *vmg = ifoOpen(dvd, 0);
+	ifo_handle_t *vmg = ifoOpen(dvd_dev, 0);
 	if (!vmg) return 1;
 
-	for (int vts = 1; vts <= vmg->vmgi_mat->vmg_nr_of_title_sets; vts++) {
-		dvd_file_t *f = DVDOpenFile(dvd, vts, DVD_READ_TITLE_VOBS);
+	for (int vts = 1; vts <= vmg->vmgi_mat->vmg_nr_of_title_sets && vts <= 99; vts++) {
+		dvd_file_t *f = DVDOpenFile(dvd_dev, vts, DVD_READ_TITLE_VOBS);
 		if (!f) continue;
 
 		int blocks = DVDFileSize(f);
 		DVDCloseFile(f);
+		vts_blocks[vts] = blocks > 0 ? blocks : 0;
 
 		if (blocks > best_blocks) {
 			best_blocks = blocks;
@@ -2715,25 +2924,27 @@ int main(int argc, char **argv) {
 	}
 
 	if (best_vts < 0) return 1;
-	// Subtitles OFF by default
-	//current_sub_sid = -1;
 	// Subtitles ON by default
 	current_sub_sid = (sub_count > 0) ? sub_sid_list[0] : -1;
-	
-	// default behavior
 	audio_sid_selected = 0x80;   // start at first legal audio stream
-     
-	ifo_handle_t *ifo = ifoOpen(dvd, best_vts);
-    if (!ifo) { return 1;}
 
-    vob = DVDOpenFile(dvd, best_vts, DVD_READ_TITLE_VOBS);
-    if (!vob) { return 1;}
-    total_blocks = DVDFileSize(vob);  // number of 2048-byte blocks
+	titles_from_vmg(vmg);
 #endif
-	fprintf(stderr, "VOB size: %d blocks\n", total_blocks);
-
 #ifdef TEST_PLAIN_VOB
-	if (getenv("MINIDVD_TEST_CELLS")) title_map_from_string(getenv("MINIDVD_TEST_CELLS"));
+	fprintf(stderr, "VOB size: %d blocks\n", total_blocks);
+	if (getenv("MINIDVD_TEST_TITLES")) {   // "cells;cells;..." (see title_map_from_string)
+		static char tbuf[4096];
+		char *p, *save = NULL;
+		snprintf(tbuf, sizeof(tbuf), "%s", getenv("MINIDVD_TEST_TITLES"));
+		for (p = strtok_r(tbuf, ";", &save); p && ntitles < MAX_TITLES; p = strtok_r(NULL, ";", &save)) {
+			title_map_from_string(p);
+			titles[ntitles].cells = p;
+			titles[ntitles].len = title_len;
+			titles[ntitles].chapters = ntchap;
+			ntitles++;
+		}
+		title_map_reset();
+	} else if (getenv("MINIDVD_TEST_CELLS")) title_map_from_string(getenv("MINIDVD_TEST_CELLS"));
 	if (getenv("MINIDVD_TEST_BAD")) {
 		unsigned long a = 0, b = 0;
 		if (sscanf(getenv("MINIDVD_TEST_BAD"), "%lu-%lu", &a, &b) == 2) {
@@ -2741,16 +2952,39 @@ int main(int argc, char **argv) {
 			test_bad_last = b;
 		}
 	}
-#else
-	if (!title_map_from_ifo(ifo))
-		fprintf(stderr, "Title: no usable program chain, playing the whole title set\n");
-	streams_from_ifo(ifo, main_pgc);
-	if (streams_known) {                  // first listed streams (subtitles on, as before)
-		audio_sid_selected = audio_count ? audio_sid_list[0] : 0x80;
-		current_sub_sid = sub_count ? sub_sid_list[0] : -1;
-	}
 #endif
-	title_start();                        // first cell of the film
+	{
+#ifdef TEST_PLAIN_VOB
+		int start = titles_choose(-1);
+#else
+		int start = titles_choose(best_vts);
+#endif
+		if (start >= 0) {
+			titles_print(start);
+			if (!title_load(start, 0)) return 1;
+		} else {
+#ifndef TEST_PLAIN_VOB
+			// no usable title table: largest title set, longest program chain
+			ifo_handle_t *ifo = vts_ifo_get(best_vts);
+			if (!ifo) return 1;
+			vob = DVDOpenFile(dvd_dev, best_vts, DVD_READ_TITLE_VOBS);
+			if (!vob) return 1;
+			total_blocks = DVDFileSize(vob);
+			open_vts = best_vts;
+			if (!title_map_from_ifo(ifo))
+				fprintf(stderr, "Title: no usable program chain, playing the whole title set\n");
+			streams_from_ifo(ifo, main_pgc);
+			if (streams_known) {          // first listed streams (subtitles on, as before)
+				audio_sid_selected = audio_count ? audio_sid_list[0] : 0x80;
+				current_sub_sid = sub_count ? sub_sid_list[0] : -1;
+			}
+#endif
+			title_start();                // first cell of the film
+		}
+	}
+#ifndef TEST_PLAIN_VOB
+	fprintf(stderr, "VOB size: %d blocks\n", total_blocks);
+#endif
 	mpeg2 = mpeg2_init();
 #ifdef SYNC_OLD
 	mpeg2_tag_picture(mpeg2, 0, 1);
@@ -2802,6 +3036,7 @@ int main(int argc, char **argv) {
 				else if (!strncmp(a, "help", 4)) { show_help = !show_help; need_redraw = 1; }
 				else if (!strncmp(a, "jump:", 5)) seek_relative(atof(a + 5));
 				else if (!strncmp(a, "chap:", 5)) seek_chapter(atoi(a + 5));
+				else if (!strncmp(a, "title:", 6)) title_step(atoi(a + 6));
 				else if (!strncmp(a, "size:", 5)) {   // size:WxH resizes the window
 					int w = atoi(a + 5), h = strchr(a, 'x') ? atoi(strchr(a, 'x') + 1) : 0;
 					if (w > 0 && h > 0) XResizeWindow(dpy, win, w, h);
@@ -2849,6 +3084,9 @@ int main(int argc, char **argv) {
 					int dir = ks == XK_Right ? 1 : -1;
 					if (ev.xkey.state & ShiftMask) seek_chapter(dir);
 					else seek_relative(dir * 10.0);
+					break;
+				} else if (ks == XK_Prior || ks == XK_Next) {   // PgUp / PgDn
+					title_step(ks == XK_Next ? 1 : -1);
 					break;
 				} else if (ks == XK_Up || ks == XK_Down) {
 					seek_relative(ks == XK_Up ? 60.0 : -60.0);
@@ -2961,9 +3199,11 @@ int main(int argc, char **argv) {
 #ifdef TEST_PLAIN_VOB
     close(vob_fd);
 #else
-    DVDCloseFile(vob);
-    ifoClose(ifo);
-    DVDClose(dvd);
+    if (vob) DVDCloseFile(vob);
+    for (int v = 1; v < 100; v++)
+        if (vts_ifo[v]) ifoClose(vts_ifo[v]);
+    ifoClose(vmg);
+    DVDClose(dvd_dev);
 #endif
     return 0;
 }

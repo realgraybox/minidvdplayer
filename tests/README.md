@@ -21,6 +21,9 @@ Test-only compile flags (never used for normal builds):
   VOB, to test skip-to-film, cell following and the jump keys. Test actions
   `jump:<secs>` and `chap:+1|-1` press the arrow keys, `sub` and `subtoggle`
   press `n` and `s`.
+- `MINIDVD_TEST_TITLES="cells;cells;..."` (with `TEST_PLAIN_VOB`): several
+  titles, each a cell list as above, to test series detection, play-on and
+  PgUp/PgDn (test action `title:+1|-1`).
 - `MINIDVD_TEST_BAD="first-last"` (with `TEST_PLAIN_VOB`): those blocks fail
   to read (after 300 ms each, like a bad sector) to test skipping damaged
   areas.
@@ -29,8 +32,8 @@ Files:
 
 - `ifo_map_test.c`: `make test-ifo` builds the title map from IFO tables
   made in memory (main title choice, BCD times, angle/broken cells,
-  chapters, start at the film, audio/subtitle stream lists and names) and
-  checks it
+  chapters, start at the film, audio/subtitle stream lists and names, title
+  table with decoy/duplicate titles, series detection) and checks it
 
 - `run_av_test.sh [old]`: generate a test VOB, build, play, print stats
 - `av_analyze.py log...`: frame interval and A/V offset statistics
