@@ -36,7 +36,7 @@ Files:
   table with decoy/duplicate titles, series detection, film versions /
   copy protection decoys, ARccOS-style dummy cells) and checks it
 
-- `run_av_test.sh [old]`: generate a test VOB, build, play, print stats
+- `run_av_test.sh`: generate a test VOB, build, play, print stats
 - `av_analyze.py log...`: frame interval and A/V offset statistics
 - `av_buckets.py log [seconds]`: the same, per second of playback
 - `strip_pts.py in.vob out.vob N`: keep the video timestamp only on every
@@ -49,11 +49,5 @@ periods):
 
 | | frame interval (target 40 ms) | frames off by > 5 ms | A/V offset |
 |---|---|---|---|
-| `SYNC=old` | 27..159 ms, sd 19 ms | 626 / 716 | about -490 ms (see note) |
-| new | 40 ms, sd 1-2 ms | 4-6 / 720 (scheduler hiccups) | mean +0.5 ms, sd 2 ms |
-
-Note: in this simulation the old code shows video about 0.5 s *before* its
-sound. On real hardware the old code was reported to be in sync, so the
-simulated card and the test file's muxing don't fully match real discs. The
-new code doesn't depend on buffer sizes or muxing: it shows frames by their
-timestamps.
+| original timing (video paced by blocking audio writes; removed) | 27..159 ms, sd 19 ms | 626 / 716 | – |
+| current | 40 ms, sd 1-3 ms | 0-10 / 720 (scheduler hiccups) | mean within ±1 ms, sd 2 ms |

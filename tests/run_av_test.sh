@@ -7,14 +7,10 @@
 # frame-interval and A/V-offset statistics. Needs ffmpeg, Xvfb (xvfb-run)
 # and python3. The VOB uses a DVD-like IBBPBBP... GOP (B-frames matter).
 #
-#   tests/run_av_test.sh          new timing
-#   tests/run_av_test.sh old      previous timing (SYNC=old)
-#
 # Extra scenarios via MINIDVD_TEST, e.g.
 #   MINIDVD_TEST="8:seek:0.5,14:pause:2,20:audio,25:audio" tests/run_av_test.sh
 set -e
 cd "$(dirname "$0")/.."
-SYNC=${1:-new}
 OUT=tests/out
 mkdir -p $OUT
 
@@ -25,10 +21,10 @@ if [ ! -f $OUT/test.vob ]; then
 fi
 
 make clean >/dev/null
-make SYNC=$SYNC EXTRA_CFLAGS="-DTEST_PLAIN_VOB -DAUDIO_HAVE_SIM" >/dev/null 2>&1
-mv minidvd $OUT/minidvd-$SYNC-test
+make EXTRA_CFLAGS="-DTEST_PLAIN_VOB -DAUDIO_HAVE_SIM" >/dev/null 2>&1
+mv minidvd $OUT/minidvd-test
 make clean >/dev/null
 
 # xvfb-run merges stderr into stdout
-xvfb-run -a -s "-screen 0 1024x768x24" $OUT/minidvd-$SYNC-test $OUT/test.vob > $OUT/$SYNC.log 2>&1 || true
-python3 tests/av_analyze.py $OUT/$SYNC.log
+xvfb-run -a -s "-screen 0 1024x768x24" $OUT/minidvd-test $OUT/test.vob > $OUT/test.log 2>&1 || true
+python3 tests/av_analyze.py $OUT/test.log
