@@ -82,18 +82,15 @@
 
 
 /*
- * A/V timing
- *   default:       every video frame is shown at its PTS, measured against a
- *                  clock that is locked to the audio playback position.
- *                  Audio is written without blocking, so it never stalls video.
- *   -DSYNC_OLD:    previous behaviour: video is paced by blocking audio writes
- *                  (plus the "pacemaker").
+ * A/V timing: every video frame is shown at its PTS, measured against a
+ * clock that is locked to the audio playback position. Audio is written
+ * without blocking, so it never stalls video.
  * Test hooks (not for normal builds):
  *   -DTEST_PLAIN_VOB   argv[1] is a plain MPEG-PS/VOB file instead of a DVD
  *   -DAUDIO_HAVE_SIM   simulated sound card; prints per-frame "AV" log lines
  */
 
-// Diagnostics (new timing): MINIDVD_DEBUG=1 prints a summary on exit,
+// Diagnostics: MINIDVD_DEBUG=1 prints a summary on exit,
 // MINIDVD_DEBUG=2 also one line per frame. MINIDVD_XSYNC=1 waits for the X
 // server to finish each frame (XSync instead of XFlush).
 static struct {
@@ -121,12 +118,6 @@ static uint32_t dvd_block;        // current read block
 static uint32_t total_blocks;
 
 //ps_demux globals
-#ifdef SYNC_OLD
-#define VIDEO_ES_BUF_SIZE (512 * 1024)
-static uint8_t video_es_buf[VIDEO_ES_BUF_SIZE];
-
-static int video_es_len = 0;
-#endif
 
 static int seek_pending = 0;
 static uint32_t seek_target_block = 0;
@@ -145,7 +136,7 @@ static int dst_h = 0;
 
 //audio output globals
 static int audio_active = 0;	// stream activity
-static __attribute__((unused)) int audio_switch_fill = 0;  // audio stream changed: fill the gap
+static int audio_switch_fill = 0;  // audio stream changed: fill the gap
 
 static int audio_rate = 48000;     // output rate
 static int audio_channels = 2;     // output channels (stereo downmix)
@@ -876,7 +867,7 @@ static void toggle_fullscreen(Display *dpy, Window win) {
 #define PTS_NONE INT64_MIN
 #define PTS_HZ   90000
 
-static __attribute__((unused)) int64_t now_us(void) {
+static int64_t now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
@@ -1337,9 +1328,7 @@ static void audio_select(int dir) {
     if (audio_sid_list[i] != audio_sid_selected) {
         audio_sid_selected = audio_sid_list[i];
         audio_stream_reset();
-#ifndef SYNC_OLD
         audio_switch_fill = 1;
-#endif
         audio_active = 1;                 // optimistic
         audio_bytes = 0;
         last_audio_bytes = 0;
@@ -1730,13 +1719,13 @@ static void seek_apply(void) {
 static struct { int64_t pts; uint32_t block; } ptsmap[PTSMAP];
 static int ptsmap_pos = 0;
 
-static __attribute__((unused)) void ptsmap_add(int64_t pts, uint32_t block) {
+static void ptsmap_add(int64_t pts, uint32_t block) {
     ptsmap[ptsmap_pos].pts = pts;
     ptsmap[ptsmap_pos].block = block;
     ptsmap_pos = (ptsmap_pos + 1) % PTSMAP;
 }
 
-static __attribute__((unused)) void ptsmap_shown(int64_t pts) {
+static void ptsmap_shown(int64_t pts) {
     static int64_t a_pts = PTS_NONE;
     static uint32_t a_block;
     if (pts == PTS_NONE) return;
@@ -1774,7 +1763,7 @@ static int64_t pes_get_pts(const uint8_t *p, int avail) {
 // that packet (at the "first access unit" offset), so positions are tracked
 // as byte offsets into the AC3 stream fed to ac3_push().
 static int64_t aq_end_pts = PTS_NONE;     // pts just after the last decoded audio
-static __attribute__((unused)) int aq_fill = 0;  // decoded frames queued, not yet in device
+static int aq_fill = 0;  // decoded frames queued, not yet in device
 static int64_t ac3_frame_pts = PTS_NONE;  // pts of the AC3 frame being decoded
 static uint64_t ac3_in_pos = 0;           // AC3 bytes consumed so far
 static uint64_t ac3_frame_pos = 0;        // stream position of current frame
@@ -1812,7 +1801,6 @@ static void ac3_reset(void) {
     ac3_frame_pts = PTS_NONE;
 }
 
-#ifndef SYNC_OLD
 // Decoded audio waiting for room in the sound card (1 s, stereo s16).
 #define AQ_FRAMES 48000
 static int16_t aq_buf[AQ_FRAMES * 2];
@@ -1835,7 +1823,6 @@ static void aq_push(const int16_t *pcm, int frames) {
         wr = (wr + n) % AQ_FRAMES;
     }
 }
-#endif
 
 static inline int16_t sample_to_s16(sample_t s) {
 #if defined(LIBA52_FIXED)
@@ -2099,14 +2086,11 @@ typedef struct {
 static spu_assembler_t spu[0x20];   // one per substream (0x20–0x3F)
 
 // helpers
-#ifndef SYNC_OLD
 static int64_t clock_now(void);
-#endif
 
 static void audio_feed(uint8_t *data, int len, void *opaque) {
 	if (!audio_enabled || audio_type != AUDIO_AC3) { return;}
 	audio_bytes += len;
-#ifndef SYNC_OLD
 	// After an audio stream change the new stream's data starts where the
 	// reader is (up to ~0.7 s ahead of the picture). Fill the gap with
 	// silence so the new audio lines up with the picture and the clock
@@ -2124,7 +2108,6 @@ static void audio_feed(uint8_t *data, int len, void *opaque) {
 			}
 		}
 	}
-#endif
 	if (ac3_frame_pts != PTS_NONE) { aq_end_pts = ac3_frame_pts;}
     int flags = A52_STEREO;
     sample_t level = 1.0;
@@ -2158,26 +2141,11 @@ static void audio_feed(uint8_t *data, int len, void *opaque) {
 
         }
         int frames = 256;  // a52 always outputs 256 PCM frames per block
-#ifdef SYNC_OLD
-        audio_write(pcm, frames);
-#else
         aq_push(pcm, frames);
-#endif
         if (aq_end_pts != PTS_NONE) { aq_end_pts += (int64_t)frames * PTS_HZ / audio_rate;}
     }
 }
 
-#ifdef SYNC_OLD
-static void video_feed(uint8_t *data, int len, int64_t pts) {
-	(void)pts;
-	if (video_es_len + len > VIDEO_ES_BUF_SIZE) {
-		fprintf(stderr, "ES buffer overflow — dropping data\n");
-        video_es_len = 0;
-    }
-    memcpy(video_es_buf + video_es_len, data, len);
-    video_es_len += len;
-}
-#else
 // Compressed video waiting for the decoder: one slot per PES payload, with
 // its PTS. Lets the reader run ahead of the display without decoding early.
 #define VQ_SLOTS 512                      // 1 MB, roughly 1-2 s of DVD video
@@ -2224,7 +2192,6 @@ static void spu_queue(const uint8_t *data, int len, int64_t pts) {
     spu_pending_len = len;
     spu_pending_pts = pts;
 }
-#endif
 
 static void demux_ps(uint8_t *buf, int len) {
     int i = 0;
@@ -2322,19 +2289,13 @@ static void demux_ps(uint8_t *buf, int len) {
 							int copy = s->expected - s->collected;
 							if (copy > len)
 								copy = len;
-								memcpy(s->buf + s->collected, buf + off, copy);
-								s->collected += copy;
+							memcpy(s->buf + s->collected, buf + off, copy);
+							s->collected += copy;
 						}
 						// Completed SPU packet
 						if (s->active && s->collected >= s->expected) {
 							if (current_sub_sid >= 0 && sid == current_sub_sid) {
-#ifdef SYNC_OLD
-								struct spu_state st;
-								memset(&st, 0, sizeof(st));
-								spu_demux_control(s->buf, s->expected, &st);
-#else
 								spu_queue(s->buf, s->expected, s->pts);
-#endif
 							}
 							s->active = 0;
 						}	
@@ -2412,7 +2373,7 @@ static void redraw(void) {
     }
     // overlay subtitles in DESTINATION space
     if (subtitle_enabled && subtitle_active && sub_valid) {
-        overlay_subtitle(ximg->data, dst_w, dst_h);
+        overlay_subtitle((uint8_t *)ximg->data, dst_w, dst_h);
     }
 
     if (shminfo.shmaddr) {
@@ -2476,9 +2437,7 @@ static void audio_stream_reset(void) {
     audio_flush();
     ac3_reset();
     aq_end_pts = PTS_NONE;
-#ifndef SYNC_OLD
     aq_rd = aq_fill = 0;
-#endif
 }
 
 #ifdef AUDIO_HAVE_SIM
@@ -2492,99 +2451,6 @@ static void av_test_log(int64_t pts, int dropped) {
 }
 #endif
 
-#ifdef SYNC_OLD
-static void playback_step(void) {
-	if (title_switch_to >= 0) {           // next/previous title (episode)
-		int i = title_switch_to;
-		title_switch_to = -1;
-		seek_pending = 0;
-		audio_flush();
-		title_load(i, 1);
-		return;
-	}
-	if (at_title_end()) {                 // next episode, or the end
-		if (!title_play_on()) running = 0;
-		return;
-	}
-	static struct timespec pacemaker_tid;
-	static int pacemaker_initialiseret = 0;
-	
-
-	if (seek_pending) {
-		seek_apply();
-		audio_flush();	// Flush audio device buffer (optional but good)
-		return; // refill pipeline cleanly
-	}
-	
-    if (mpeg2_parse(mpeg2) == STATE_BUFFER) {	// Feed decoder if it needs data
-        if (read_title_block(buf) != 1) {
-            return;
-        }
-		demux_ps(buf, 2048);
-        if (video_es_len > 0) {
-			mpeg2_buffer(mpeg2, video_es_buf, video_es_buf + video_es_len);
-			video_es_len = 0;
-		}
-    }
-    
-	int state;
-	while ((state = mpeg2_parse(mpeg2)) != STATE_BUFFER) { // Drain decoder until it blocks again
-		if (state == STATE_SEQUENCE) {
-			new_sequence();
-		}
-		
-		// libmpeg2 returns STATE_SLICE/STATE_END once per finished picture.
-		// Don't compare display_fbuf with the previous one: every B-frame is
-		// decoded into the same buffer, so that would skip every second B-frame.
-		if ((state == STATE_SLICE || state == STATE_END || state == STATE_INVALID_END) &&
-			info->display_fbuf && info->display_picture && rgb_ok) {
-			
-			have_frame = 1;
-
-			// center video in window
-			video_x = (win_w - video_w) / 2;
-			video_y = (win_h - video_h) / 2;
-			// --- AUDIO-AWARE PACEMAKER START ---
-struct timespec nu_tid;
-clock_gettime(CLOCK_MONOTONIC, &nu_tid);
-
-if (pacemaker_initialiseret) {
-    long elapsed_us = (nu_tid.tv_sec - pacemaker_tid.tv_sec) * 1000000 +
-                   (nu_tid.tv_nsec - pacemaker_tid.tv_nsec) / 1000;
-
-    // Hvis der er gået lang tid (f.eks. over 60ms), betyder det, at tråden
-    // har været låst af lydkortet. Vi skal IKKE bremse dette billede,
-    // da det skal matche den lyd, der lige er blevet spillet!
-    if (elapsed_us > 60000) {
-        // Lad billedet komme ud med det samme for at bevare lipsync
-    } 
-    // Hvis tråden kører i høj fart (under 38ms pr. billede), bremser vi den en lille smule,
-    // så bevægelserne bliver mere flydende, men uden at vi over-bremser.
-    else if (elapsed_us < 38000) {
-        long sleep_us = 38000 - elapsed_us;
-        if (sleep_us > 25000) sleep_us = 25000; // Sikkerhedsbarriere
-        usleep(sleep_us);
-        clock_gettime(CLOCK_MONOTONIC, &nu_tid); // Opdater tiden efter søvn
-    }
-} else {
-    pacemaker_initialiseret = 1;
-}
-pacemaker_tid = nu_tid;
-// --- AUDIO-AWARE PACEMAKER SLUT ---
-			redraw();
-			disp_block = dvd_block;
-#ifdef AUDIO_HAVE_SIM
-			av_test_log(PTS_NONE, 0);
-#endif
-			
-            if (!audio_active) {
-				usleep(35000); // pace ONLY on video output if no audio  
-            }    
-		}
-    }
-}
-
-#else /* new A/V timing */
 
 // ---- master clock ----------------------------------------------------------
 // Runs on the system clock (smooth) and is locked to the audio position.
@@ -3054,7 +2920,6 @@ static void playback_step(void) {
         sleep_us(5000);
     }
 }
-#endif /* SYNC_OLD */
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -3166,9 +3031,6 @@ int main(int argc, char **argv) {
 	fprintf(stderr, "VOB size: %d blocks\n", total_blocks);
 #endif
 	mpeg2 = mpeg2_init();
-#ifdef SYNC_OLD
-	mpeg2_tag_picture(mpeg2, 0, 1);
-#else
 	{   // optional A/V fine tuning: + = show video later
 		const char *dl = getenv("MINIDVD_DEBUG");
 		const char *xs = getenv("MINIDVD_XSYNC");
@@ -3180,7 +3042,6 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "A/V offset: %d ms\n", atoi(e));
 		}
 	}
-#endif
 	info = mpeg2_info(mpeg2);   // RGB conversion: set up per sequence (new_sequence)
     
     a52 = a52_init(0);
@@ -3342,31 +3203,20 @@ int main(int argc, char **argv) {
 		}
 		
 		//if silent audio substream:
-#ifdef SYNC_OLD
-		static int audio_check_counter = 0;
-		audio_check_counter++;
-		if (audio_check_counter >= 50) {   // ~1 sec at 50 fps loop
-#else
 		static int64_t audio_check_us = 0;
 		if (!audio_check_us) audio_check_us = now_us();
 		if (now_us() - audio_check_us >= 1000000) {   // once a second
 			audio_check_us = now_us();
-#endif
 			if (audio_bytes == last_audio_bytes) {
 				audio_active = 0;
 			} else {
 				audio_active = 1;
 			}
 			last_audio_bytes = audio_bytes;
-#ifdef SYNC_OLD
-			audio_check_counter = 0;
-#endif
 		}
 	} //while running
 
-#ifndef SYNC_OLD
 	dbg_summary();
-#endif
 	render_cleanup();
 	if (ximg) {
 		destroy_ximage();
