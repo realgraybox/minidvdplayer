@@ -1351,6 +1351,11 @@ typedef struct {
     const char *cells;                    // test: cell list
     double len;
     int chapters;
+    uint32_t (*rng)[2];                   // sector ranges of its cells
+    int nrng;
+    double blocks;                        // total sectors
+    int in_series;                        // part of the episodes played in order
+    int version_of;                       // -1, or the title it is a version of
 } dvdtitle_t;
 static dvdtitle_t titles[MAX_TITLES];
 static int ntitles = 0, cur_title = -1;
@@ -1416,6 +1421,17 @@ static void titles_from_vmg(ifo_handle_t *vmg) {
         titles[ntitles].pgcn = pgcn;
         titles[ntitles].len = len;
         titles[ntitles].chapters = ti->nr_of_ptts;
+        titles[ntitles].rng = malloc(sizeof(*titles[0].rng) * pgc->nr_of_cells);
+        titles[ntitles].nrng = 0;
+        titles[ntitles].blocks = blocks;
+        for (int c = 0; titles[ntitles].rng && c < pgc->nr_of_cells; c++) {
+            cell_playback_t *cp = &pgc->cell_playback[c];
+            if (cp->first_sector <= cp->last_sector && cp->last_sector < vts_blocks[v]) {
+                titles[ntitles].rng[titles[ntitles].nrng][0] = cp->first_sector;
+                titles[ntitles].rng[titles[ntitles].nrng][1] = cp->last_sector;
+                titles[ntitles].nrng++;
+            }
+        }
         ntitles++;
     }
 }
@@ -1425,16 +1441,80 @@ static int title_similar(int i) {
     return titles[i].len >= 0.5 * series_ref && titles[i].len <= 1.5 * series_ref;
 }
 
+// sectors two titles have in common
+static double title_shared(int i, int j) {
+    double n = 0;
+    if (titles[i].vts != titles[j].vts) return 0;
+    for (int a = 0; a < titles[i].nrng; a++)
+        for (int b = 0; b < titles[j].nrng; b++) {
+            uint32_t lo = titles[i].rng[a][0] > titles[j].rng[b][0] ? titles[i].rng[a][0] : titles[j].rng[b][0];
+            uint32_t hi = titles[i].rng[a][1] < titles[j].rng[b][1] ? titles[i].rng[a][1] : titles[j].rng[b][1];
+            if (lo <= hi) n += hi - lo + 1;
+        }
+    return n;
+}
+
+// Two titles of similar length that share most of their sectors are
+// versions of the same film (e.g. copy protection decoys, or theatrical
+// and extended cut), not episodes.
+static int title_versions(int i, int j) {
+    double m = titles[i].blocks < titles[j].blocks ? titles[i].blocks : titles[j].blocks;
+    return i != j && m > 0 && title_shared(i, j) >= 0.5 * m;
+}
+
+// sectors of title i used by no other title in 'set' (junk cells of a decoy)
+static double title_own_blocks(int i, const int *set, int nset) {
+    double own = 0;
+    for (int a = 0; a < titles[i].nrng; a++) {
+        // count sectors of this range not covered by the others, sector
+        // ranges are small enough to do it range by range
+        uint32_t lo = titles[i].rng[a][0], hi = titles[i].rng[a][1];
+        double covered = 0;
+        // merge the parts of other titles' ranges that fall into [lo, hi]
+        uint32_t cut[512][2];
+        int nc = 0;
+        for (int k = 0; k < nset; k++) {
+            int j = set[k];
+            if (j == i || titles[j].vts != titles[i].vts) continue;
+            for (int b = 0; b < titles[j].nrng && nc < 512; b++) {
+                uint32_t l = titles[j].rng[b][0] > lo ? titles[j].rng[b][0] : lo;
+                uint32_t h = titles[j].rng[b][1] < hi ? titles[j].rng[b][1] : hi;
+                if (l <= h) { cut[nc][0] = l; cut[nc][1] = h; nc++; }
+            }
+        }
+        // union length of the cut pieces (simple insertion sort, few pieces)
+        for (int x = 1; x < nc; x++)
+            for (int y = x; y > 0 && cut[y][0] < cut[y - 1][0]; y--) {
+                uint32_t t0 = cut[y][0], t1 = cut[y][1];
+                cut[y][0] = cut[y - 1][0]; cut[y][1] = cut[y - 1][1];
+                cut[y - 1][0] = t0; cut[y - 1][1] = t1;
+            }
+        for (int x = 0; x < nc; ) {
+            uint32_t l = cut[x][0], h = cut[x][1];
+            for (x++; x < nc && cut[x][0] <= h + 1; x++)
+                if (cut[x][1] > h) h = cut[x][1];
+            covered += h - l + 1;
+        }
+        own += (hi - lo + 1) - covered;
+    }
+    return own;
+}
+
 static int next_series_title(int cur) {
     if (!series) return -1;
     for (int j = cur + 1; j < ntitles; j++)
-        if (title_similar(j)) return j;
+        if (titles[j].in_series) return j;
     return -1;
 }
 
 // Pick the start title; largest_vts < 0: longest title.
 static int titles_choose(int largest_vts) {
     int main_t = -1, group = 0, first = -1;
+    int vset[MAX_TITLES], nv = 0;
+    for (int i = 0; i < ntitles; i++) {
+        titles[i].in_series = 0;
+        titles[i].version_of = -1;
+    }
     for (int i = 0; i < ntitles; i++)
         if (titles[i].vts == largest_vts && (main_t < 0 || titles[i].len > titles[main_t].len))
             main_t = i;
@@ -1443,9 +1523,41 @@ static int titles_choose(int largest_vts) {
             if (main_t < 0 || titles[i].len > titles[main_t].len) main_t = i;
     if (main_t < 0) return -1;
     series_ref = titles[main_t].len;
+
+    // versions of the main title: play the one with the fewest sectors of
+    // its own (decoys add junk cells; the film's cells are shared by all)
+    vset[nv++] = main_t;
     for (int i = 0; i < ntitles; i++)
-        if (title_similar(i)) { group++; if (first < 0) first = i; }
+        if (title_similar(i) && title_versions(i, main_t)) vset[nv++] = i;
+    if (nv > 1) {
+        int best = main_t;
+        double best_own = title_own_blocks(main_t, vset, nv);
+        for (int k = 1; k < nv; k++) {
+            double own = title_own_blocks(vset[k], vset, nv);
+            if (own < best_own || (own == best_own && vset[k] < best)) {
+                best = vset[k];
+                best_own = own;
+            }
+        }
+        main_t = best;
+        for (int k = 0; k < nv; k++)
+            if (vset[k] != main_t) titles[vset[k]].version_of = main_t;
+    }
+
+    // episodes: similar length, not a version of an episode already taken
+    for (int i = 0; i < ntitles; i++) {
+        int dup = titles[i].version_of >= 0;
+        if (!title_similar(i)) continue;
+        for (int j = 0; j < i && !dup; j++)
+            if (titles[j].in_series && title_versions(i, j)) dup = 1;
+        if (dup) continue;
+        titles[i].in_series = 1;
+        group++;
+        if (first < 0) first = i;
+    }
     series = group >= 3;
+    if (!series)
+        for (int i = 0; i < ntitles; i++) titles[i].in_series = 0;
     return series ? first : main_t;
 }
 
@@ -1454,9 +1566,12 @@ static void titles_print(int start) {
             series ? " (series: similar titles play in order)" : "");
     for (int i = 0; i < ntitles; i++) {
         int t = (int)titles[i].len;
-        fprintf(stderr, "  %c Title %d: %d:%02d:%02d, %d chapters\n",
-                i == start ? '>' : (series && title_similar(i) ? '*' : ' '),
-                i + 1, t / 3600, (t / 60) % 60, t % 60, titles[i].chapters);
+        char note[48] = "";
+        if (titles[i].version_of >= 0)
+            snprintf(note, sizeof(note), "  (version of title %d)", titles[i].version_of + 1);
+        fprintf(stderr, "  %c Title %d: %d:%02d:%02d, %d chapters%s\n",
+                i == start ? '>' : titles[i].in_series ? '*' : titles[i].version_of >= 0 ? '~' : ' ',
+                i + 1, t / 3600, (t / 60) % 60, t % 60, titles[i].chapters, note);
     }
 }
 
@@ -2952,6 +3067,15 @@ int main(int argc, char **argv) {
 			titles[ntitles].cells = p;
 			titles[ntitles].len = title_len;
 			titles[ntitles].chapters = ntchap;
+			titles[ntitles].rng = malloc(sizeof(*titles[0].rng) * (ntcells ? ntcells : 1));
+			titles[ntitles].nrng = 0;
+			titles[ntitles].blocks = 0;
+			for (int c = 0; titles[ntitles].rng && c < ntcells; c++) {
+				titles[ntitles].rng[c][0] = tcells[c].first;
+				titles[ntitles].rng[c][1] = tcells[c].last;
+				titles[ntitles].blocks += tcells[c].last - tcells[c].first + 1;
+				titles[ntitles].nrng++;
+			}
 			ntitles++;
 		}
 		title_map_reset();
