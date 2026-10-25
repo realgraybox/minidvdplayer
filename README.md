@@ -63,6 +63,16 @@ previous/next title. The titles are listed at startup. If the disc has no
 usable title information, the whole title set is played and jumps are
 estimated from the bitrate.
 
+Limitations:
+
+- No DVD menus or navigation commands (minidvd plays the title directly).
+- ARccOS-protected discs (Sony, around 2005-2008, e.g. The Da Vinci Code)
+  are not supported. minidvd skips the obviously fake cells, but the
+  remaining unreadable sectors are normally avoided via the disc's
+  navigation commands, so playback stalls on read errors (it gets past
+  them, slowly).
+- Only AC3 audio is played (DTS, LPCM and MPEG audio tracks are skipped).
+
 Audio and subtitle streams are taken from the IFO too: `a` and `n` step
 through the streams the film actually has (AC3 audio only; DTS/LPCM/MPEG
 audio is skipped), and a short on-screen message names the language and
