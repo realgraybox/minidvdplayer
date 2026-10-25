@@ -64,6 +64,41 @@ int main(void) {
     assert(c == 1 && NEAR(time_at_block(b), 1500.0) == 0 ? fabs(time_at_block(b) - 1500.0) < 1.0 : 1);
     title_start();
     assert(dvd_block == 50000 && cur_cell == 0);           // starts at the film, not sector 0
-    printf("starts at block %u\nOK\n", dvd_block);
+    printf("starts at block %u\n", dvd_block);
+
+    // ---- stream tables: 16:9 title set ----
+    static vtsi_mat_t mat;
+    ifo.vtsi_mat = &mat;
+    mat.vts_video_attr.display_aspect_ratio = 3;          // 16:9
+    mat.nr_of_vts_audio_streams = 3;
+    mat.vts_audio_attr[0].audio_format = 0; mat.vts_audio_attr[0].channels = 5;  // AC3 5.1
+    mat.vts_audio_attr[0].lang_type = 1; mat.vts_audio_attr[0].lang_code = ('e' << 8) | 'n';
+    mat.vts_audio_attr[1].audio_format = 6; mat.vts_audio_attr[1].channels = 5;  // DTS: skip
+    mat.vts_audio_attr[1].lang_type = 1; mat.vts_audio_attr[1].lang_code = ('d' << 8) | 'a';
+    mat.vts_audio_attr[2].audio_format = 0; mat.vts_audio_attr[2].channels = 1;  // AC3 stereo
+    mat.vts_audio_attr[2].lang_type = 1; mat.vts_audio_attr[2].lang_code = ('e' << 8) | 'n';
+    mat.vts_audio_attr[2].lang_extension = 3;                                   // director's comments
+    pb.audio_control[0] = 0x8000 | (0 << 8);              // logical 0 -> AC3 #0
+    pb.audio_control[1] = 0x8000 | (0 << 8);              // logical 1 -> DTS #0
+    pb.audio_control[2] = 0x8000 | (1 << 8);              // logical 2 -> AC3 #1
+    mat.nr_of_vts_subp_streams = 3;
+    mat.vts_subp_attr[0].type = 1; mat.vts_subp_attr[0].lang_code = ('d' << 8) | 'a';
+    mat.vts_subp_attr[1].type = 1; mat.vts_subp_attr[1].lang_code = ('E' << 8) | 'N';  // upper case
+    mat.vts_subp_attr[1].lang_extension = 2;              // large
+    mat.vts_subp_attr[2].type = 1; mat.vts_subp_attr[2].lang_code = ('d' << 8) | 'e';
+    // 4:3 id << 24 | wide id << 16 | letterbox << 8 | pan&scan; logical 2 not in title
+    pb.subp_control[0] = 0x80000000u | (0u << 24) | (1u << 16);
+    pb.subp_control[1] = 0x80000000u | (2u << 24) | (3u << 16);
+    pb.subp_control[2] = 0;
+
+    streams_from_ifo(&ifo, main_pgc);
+    assert(main_pgc == &pb);
+    assert(streams_known && audio_count == 2 && sub_count == 2);
+    assert(audio_sid_list[0] == 0x80 && !strcmp(audio_name[0], "English, AC3 5.1"));
+    assert(audio_sid_list[1] == 0x81 &&
+           !strcmp(audio_name[1], "English, AC3 stereo, director's comments"));
+    assert(sub_sid_list[0] == 0x21 && !strcmp(sub_name[0], "Danish"));     // wide stream ids
+    assert(sub_sid_list[1] == 0x23 && !strcmp(sub_name[1], "English, large"));
+    printf("OK\n");
     return 0;
 }

@@ -57,6 +57,12 @@ chapters and cell times are used for the jump keys below. If the disc has no
 usable program chain, the whole title set is played and jumps are estimated
 from the bitrate.
 
+Audio and subtitle streams are taken from the IFO too: `a` and `n` step
+through the streams the film actually has (AC3 audio only; DTS/LPCM/MPEG
+audio is skipped), and a short on-screen message names the language and
+kind, e.g. "Audio 2/3: English, AC3 5.1, director's comments" or
+"Subtitles 1/4: Danish".
+
 Keys:
 Space: Pause
 m: Mute
@@ -70,7 +76,7 @@ a: Next audio stream
 Shift + a: Previous audio stream
 f: Fullscreen
 h: Toggle help
-n: Next subtitle stream
+n: Next subtitle stream (turns subtitles on)
 Shift + n: Previous subtitle stream
 s: Toggle subtitle ON/OFF
 q / Esc: Quit
