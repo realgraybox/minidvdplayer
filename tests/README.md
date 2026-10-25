@@ -24,7 +24,7 @@ Test-only compile flags (never used for normal builds):
 - `MINIDVD_TEST_TITLES="cells;cells;..."` (with `TEST_PLAIN_VOB`): several
   titles, each a cell list as above, to test series detection, play-on and
   PgUp/PgDn (test action `title:+1|-1`).
-- `MINIDVD_TEST_BAD="first-last"` (with `TEST_PLAIN_VOB`): those blocks fail
+- `MINIDVD_TEST_BAD="first-last,..."` (with `TEST_PLAIN_VOB`): those blocks fail
   to read (after 300 ms each, like a bad sector) to test skipping damaged
   areas.
 
