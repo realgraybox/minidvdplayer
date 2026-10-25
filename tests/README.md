@@ -34,7 +34,7 @@ Files:
   made in memory (main title choice, BCD times, angle/broken cells,
   chapters, start at the film, audio/subtitle stream lists and names, title
   table with decoy/duplicate titles, series detection, film versions /
-  copy protection decoys) and checks it
+  copy protection decoys, ARccOS-style dummy cells) and checks it
 
 - `run_av_test.sh [old]`: generate a test VOB, build, play, print stats
 - `av_analyze.py log...`: frame interval and A/V offset statistics

@@ -24,19 +24,19 @@ int main(void) {
 
     total_blocks = 100000;
     // PGC 1: a 5 minute extra
-    ca[0] = (cell_playback_t){0}; ca[0].first_sector = 0; ca[0].last_sector = 999; ca[0].playback_time = T(0,2,0,0);
-    ca[1] = ca[0]; ca[1].first_sector = 1000; ca[1].last_sector = 1999; ca[1].playback_time = T(0,3,0,0);
+    ca[0] = (cell_playback_t){0}; ca[0].first_sector = 0; ca[0].last_sector = 999; ca[0].last_vobu_start_sector = ca[0].first_sector; ca[0].playback_time = T(0,2,0,0);
+    ca[1] = ca[0]; ca[1].first_sector = 1000; ca[1].last_sector = 1999; ca[1].last_vobu_start_sector = ca[1].first_sector; ca[1].playback_time = T(0,3,0,0);
     pa.nr_of_cells = 2; pa.cell_playback = ca; pa.playback_time = T(0,5,0,0);
     // PGC 2: the film, 1:58:33 = 7113 s
     for (int i = 0; i < 6; i++) cb[i] = (cell_playback_t){0};
-    cb[0].first_sector = 50000; cb[0].last_sector = 59999; cb[0].playback_time = T(0,20,0,12); // 1200.48 s
-    cb[1].first_sector = 2000;  cb[1].last_sector = 9999;  cb[1].playback_time = T(0,30,0,0);  // earlier on disc
-    cb[2] = cb[1]; cb[2].first_sector = 10000; cb[2].last_sector = 14999; cb[2].playback_time = T(0,10,0,0);
+    cb[0].first_sector = 50000; cb[0].last_sector = 59999; cb[0].last_vobu_start_sector = cb[0].first_sector; cb[0].playback_time = T(0,20,0,12); // 1200.48 s
+    cb[1].first_sector = 2000;  cb[1].last_sector = 9999; cb[1].last_vobu_start_sector = cb[1].first_sector;  cb[1].playback_time = T(0,30,0,0);  // earlier on disc
+    cb[2] = cb[1]; cb[2].first_sector = 10000; cb[2].last_sector = 14999; cb[2].last_vobu_start_sector = cb[2].first_sector; cb[2].playback_time = T(0,10,0,0);
     cb[2].block_type = BLOCK_TYPE_ANGLE_BLOCK; cb[2].block_mode = BLOCK_MODE_FIRST_CELL;      // angle 1
-    cb[3] = cb[2]; cb[3].first_sector = 15000; cb[3].last_sector = 19999;
+    cb[3] = cb[2]; cb[3].first_sector = 15000; cb[3].last_sector = 19999; cb[3].last_vobu_start_sector = cb[3].first_sector;
     cb[3].block_mode = BLOCK_MODE_LAST_CELL;                                                  // angle 2: skip
-    cb[4].first_sector = 20000; cb[4].last_sector = 49999; cb[4].playback_time = T(0,58,32,13); // 3512.52 s
-    cb[5].first_sector = 99000; cb[5].last_sector = 200000; cb[5].playback_time = T(0,0,1,0); // past the end: skip
+    cb[4].first_sector = 20000; cb[4].last_sector = 49999; cb[4].last_vobu_start_sector = cb[4].first_sector; cb[4].playback_time = T(0,58,32,13); // 3512.52 s
+    cb[5].first_sector = 99000; cb[5].last_sector = 200000; cb[5].last_vobu_start_sector = cb[5].first_sector; cb[5].playback_time = T(0,0,1,0); // past the end: skip
     pb.nr_of_cells = 6; pb.cell_playback = cb; pb.playback_time = T(1,58,33,0);
     pb.nr_of_programs = 3; pb.program_map = pmap;
     srp[0].pgc = &pa; srp[1].pgc = &pb;
@@ -118,7 +118,7 @@ int main(void) {
     for (int i = 0; i < 6; i++) {
         ec[i] = (cell_playback_t){0};
         ec[i].first_sector = 1000000 * i;
-        ec[i].last_sector = 1000000 * i + (i == 5 ? 9 : 799999);  // ~300 blocks/s; decoy: 10 blocks
+        ec[i].last_sector = 1000000 * i + (i == 5 ? 9 : 799999); ec[i].last_vobu_start_sector = ec[i].first_sector;  // ~300 blocks/s; decoy: 10 blocks
         ec[i].playback_time = T(mins[i] / 60, mins[i] % 60, 0, 0);
         ep[i] = (pgc_t){0};
         ep[i].nr_of_cells = 1; ep[i].cell_playback = &ec[i];
@@ -168,7 +168,7 @@ int main(void) {
         int n[4] = { 0, 0, 0, 0 };
         uint32_t junk = 3000000;
         #define CELL(t, first, last, sec) do { cell_playback_t *c_ = &pc[t][n[t]++]; \
-            *c_ = (cell_playback_t){0}; c_->first_sector = (first); c_->last_sector = (last); \
+            *c_ = (cell_playback_t){0}; c_->first_sector = (first); c_->last_sector = (last); c_->last_vobu_start_sector = (first); \
             c_->playback_time = T(0, (sec) / 60, (sec) % 60, 0); } while (0)
         for (int r = 0; r < 28; r++) {
             CELL(0, r * 70000, r * 70000 + 69999, 216);                      // film
@@ -190,7 +190,7 @@ int main(void) {
         static cell_playback_t xc[9];
         for (int x = 0; x < 9; x++) {
             xc[x] = (cell_playback_t){0};
-            xc[x].first_sector = 4000000 + x * 50000; xc[x].last_sector = xc[x].first_sector + 39999;
+            xc[x].first_sector = 4000000 + x * 50000; xc[x].last_sector = xc[x].first_sector + 39999; xc[x].last_vobu_start_sector = xc[x].first_sector;
             xc[x].playback_time = T(0, 2, 0, 0);
             pp[4 + x] = (pgc_t){0};
             pp[4 + x].nr_of_cells = 1; pp[4 + x].cell_playback = &xc[x];
@@ -244,7 +244,7 @@ int main(void) {
             double secs = tl[i][0] * 3600 + tl[i][1] * 60 + tl[i][2];
             uint32_t len = (uint32_t)(secs * 300) + 1;   // ~300 blocks/s
             tc[i] = (cell_playback_t){0};
-            tc[i].first_sector = at; tc[i].last_sector = at + len - 1; at += len;
+            tc[i].first_sector = at; tc[i].last_sector = at + len - 1; tc[i].last_vobu_start_sector = tc[i].first_sector; at += len;
             tc[i].playback_time = T(tl[i][0], tl[i][1], tl[i][2], 0);
             tp[i] = (pgc_t){0};
             tp[i].nr_of_cells = 1; tp[i].cell_playback = &tc[i]; tp[i].playback_time = tc[i].playback_time;
@@ -266,6 +266,44 @@ int main(void) {
         int tstart = titles_choose(1);
         titles_print(tstart);
         assert(series && tstart == 0 && next_series_title(0) == 1 && next_series_title(1) == -1);
+    }
+
+    // ---- ARccOS-style dummy cells inside the film's own program chain ----
+    {
+        static cell_playback_t ac[12];
+        static pgc_t apgc;
+        static uint8_t amap[3] = { 1, 4, 8 };
+        int k = 0;
+        total_blocks = 2000000;
+        for (int r = 0; r < 12; r++) {
+            cell_playback_t *c = &ac[k++];
+            *c = (cell_playback_t){0};
+            c->first_sector = r * 100000;
+            c->last_sector = r * 100000 + 89999;
+            c->last_vobu_start_sector = c->first_sector + 89000;
+            c->playback_time = T(0, 10, 0, 0);
+            if (r == 2 || r == 5) {                 // dummy: last VOBU before the cell
+                c->first_sector = 1500000 + r * 10;
+                c->last_sector = c->first_sector + 9;
+                c->last_vobu_start_sector = 1000;
+                c->playback_time = T(0, 0, 0, 1);
+            }
+            if (r == 9) {                           // dummy: no playing time
+                c->first_sector = 1600000;
+                c->last_sector = 1600009;
+                c->last_vobu_start_sector = 1600000;
+                c->playback_time = T(0, 0, 0, 0);
+            }
+        }
+        apgc = (pgc_t){0};
+        apgc.nr_of_cells = 12; apgc.cell_playback = ac; apgc.playback_time = T(1, 30, 0, 2);
+        apgc.nr_of_programs = 3; apgc.program_map = amap;
+        assert(title_map_from_pgc(&apgc, 1));
+        printf("ARccOS test: %d cells, %.0f s, %d chapters\n", ntcells, title_len, ntchap);
+        assert(ntcells == 9 && NEAR(title_len, 9 * 600.0));
+        for (int i = 0; i < ntcells; i++)
+            assert(tcells[i].first < 1500000);     // no dummy cell left
+        assert(ntchap == 3 && NEAR(tchap[1], 2 * 600.0) && NEAR(tchap[2], 5 * 600.0));
     }
 
     // a movie disc: one long title + extras -> no series, start at the film
