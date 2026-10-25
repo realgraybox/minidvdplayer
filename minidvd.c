@@ -1048,18 +1048,26 @@ static int read_title_block(uint8_t *b) {
         return 0;
     }
     {
-        // Unreadable sector (scratch, copy protection): the drive may retry
-        // each bad sector for seconds, so skip ahead in growing steps
-        // (16, 32, ... 1024 blocks) until reading works again.
-        static uint32_t err_step = 0;
+        // Unreadable sector (scratch, copy protection): a failed read can
+        // take the drive 5-30 s of retries, so the number of failed reads
+        // matters most. Skip ahead in growing steps (64, 128 ... 4096
+        // blocks) and remember recent errors: damaged areas often have
+        // small readable islands, so the step only shrinks again (halves)
+        // per 256 good blocks instead of starting over after one good read.
+        static uint32_t err_step = 0, good_since = 0;
         static int64_t last_msg_us = 0;
         uint32_t lba = dvd_block++;
         int r = read_block(lba, b);
         if (r == 1) {
-            err_step = 0;
+            if (err_step && ++good_since >= 256) {
+                err_step /= 2;
+                good_since = 0;
+                if (err_step < 64) err_step = 0;
+            }
             return 1;
         }
-        err_step = err_step ? (err_step < 1024 ? err_step * 2 : 1024) : 16;
+        good_since = 0;
+        err_step = err_step ? (err_step < 4096 ? err_step * 2 : 4096) : 64;
         dvd_block += err_step;
         dbg.read_errors++;
         dbg.blocks_skipped += err_step;
@@ -2289,12 +2297,15 @@ static void new_sequence(void) {
 
 #ifdef TEST_PLAIN_VOB
 static int vob_fd = -1;
-static uint32_t test_bad_first = 1, test_bad_last = 0;   // MINIDVD_TEST_BAD="first-last"
+// MINIDVD_TEST_BAD="first-last,first-last,..." blocks fail to read
+static uint32_t test_bad[16][2];
+static int test_nbad = 0;
 static int read_block(uint32_t lba, uint8_t *b) {
-    if (lba >= test_bad_first && lba <= test_bad_last) {
-        usleep(300000);                   // a bad sector takes the drive a while
-        return 0;
-    }
+    for (int i = 0; i < test_nbad; i++)
+        if (lba >= test_bad[i][0] && lba <= test_bad[i][1]) {
+            usleep(300000);               // a bad sector takes the drive a while
+            return 0;
+        }
     return pread(vob_fd, b, 2048, (off_t)lba * 2048) == 2048 ? 1 : 0;
 }
 #else
@@ -2945,12 +2956,15 @@ int main(int argc, char **argv) {
 		}
 		title_map_reset();
 	} else if (getenv("MINIDVD_TEST_CELLS")) title_map_from_string(getenv("MINIDVD_TEST_CELLS"));
-	if (getenv("MINIDVD_TEST_BAD")) {
+	for (const char *p = getenv("MINIDVD_TEST_BAD"); p && *p && test_nbad < 16; ) {
 		unsigned long a = 0, b = 0;
-		if (sscanf(getenv("MINIDVD_TEST_BAD"), "%lu-%lu", &a, &b) == 2) {
-			test_bad_first = a;
-			test_bad_last = b;
+		if (sscanf(p, "%lu-%lu", &a, &b) == 2) {
+			test_bad[test_nbad][0] = a;
+			test_bad[test_nbad][1] = b;
+			test_nbad++;
 		}
+		p = strchr(p, ',');
+		if (p) p++;
 	}
 #endif
 	{
