@@ -53,8 +53,8 @@ Usage: minidvd /dev/your-dvd-drive or minidvd /dev/your-mounted-dvd-iso-path.
 
 minidvd plays the main title (the longest title in the largest title set),
 cell by cell, so logos and extras outside the film are skipped. Its chapters
-and cell times are used for the jump keys below. On series discs (at least
-three titles of similar length, e.g. episodes) playback starts at the first
+and cell times are used for the jump keys below. On series discs (two or
+more separate titles of similar length, e.g. episodes) playback starts at the first
 of them and continues through the others in disc order. Titles of similar
 length that share most of their disc sectors are versions of one film (e.g.
 copy protection decoys, which add unreadable cells), not episodes: minidvd

@@ -224,6 +224,50 @@ int main(void) {
         assert(titles[10].version_of == 0 && titles[11].version_of == 0 && titles[12].version_of == 0);
     }
 
+    // two separate titles of similar length (the user's discs: 1:03:19 and
+    // 1:05:30 + extras) -> both play, starting with title 1
+    {
+        static cell_playback_t tc[7];
+        static pgc_t tp[7];
+        static pgci_srp_t tsrp[7];
+        static pgcit_t tpgcit;
+        static ptt_info_t tptt[7];
+        static ttu_t tttu[7];
+        static vts_ptt_srpt_t tptts;
+        static vtsi_mat_t tmat;
+        static ifo_handle_t tvts, tvmg;
+        static title_info_t tti[7];
+        static tt_srpt_t ttt;
+        static const int tl[7][3] = { {1,3,19}, {1,5,30}, {0,0,5}, {0,24,21}, {0,6,7}, {0,5,41}, {0,6,45} };
+        uint32_t at = 0;
+        for (int i = 0; i < 7; i++) {
+            double secs = tl[i][0] * 3600 + tl[i][1] * 60 + tl[i][2];
+            uint32_t len = (uint32_t)(secs * 300) + 1;   // ~300 blocks/s
+            tc[i] = (cell_playback_t){0};
+            tc[i].first_sector = at; tc[i].last_sector = at + len - 1; at += len;
+            tc[i].playback_time = T(tl[i][0], tl[i][1], tl[i][2], 0);
+            tp[i] = (pgc_t){0};
+            tp[i].nr_of_cells = 1; tp[i].cell_playback = &tc[i]; tp[i].playback_time = tc[i].playback_time;
+            tsrp[i].pgc = &tp[i];
+            tptt[i].pgcn = i + 1; tptt[i].pgn = 1;
+            tttu[i].nr_of_ptts = 1; tttu[i].ptt = &tptt[i];
+            tti[i] = (title_info_t){0};
+            tti[i].title_set_nr = 1; tti[i].vts_ttn = i + 1; tti[i].nr_of_ptts = 11;
+        }
+        tpgcit.nr_of_pgci_srp = 7; tpgcit.pgci_srp = tsrp;
+        tptts.nr_of_srpts = 7; tptts.title = tttu;
+        tvts.vts_pgcit = &tpgcit; tvts.vts_ptt_srpt = &tptts; tvts.vtsi_mat = &tmat;
+        vts_ifo[1] = &tvts;
+        vts_blocks[1] = at;
+        ttt.nr_of_srpts = 7; ttt.title = tti;
+        tvmg.tt_srpt = &ttt;
+        ntitles = 0;
+        titles_from_vmg(&tvmg);
+        int tstart = titles_choose(1);
+        titles_print(tstart);
+        assert(series && tstart == 0 && next_series_title(0) == 1 && next_series_title(1) == -1);
+    }
+
     // a movie disc: one long title + extras -> no series, start at the film
     ntitles = 0;
     titles[ntitles++] = (dvdtitle_t){ 1, 1, NULL, 6300, 20 };
