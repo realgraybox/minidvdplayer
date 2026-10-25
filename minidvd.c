@@ -1341,8 +1341,8 @@ static void sub_toggle(void) {
 
 // ------------------ titles (episodes) ------------------
 // The disc's title table lists its titles. minidvd starts with the main
-// title (longest title in the largest title set). If at least 3 titles
-// have a similar length (50-150% of it) the disc is treated as a series:
+// title (longest title in the largest title set). If 2 or more separate
+// titles have a similar length (50-150% of it) the disc is a series:
 // playback starts at the first of them and continues through the others
 // in disc order. PgUp/PgDn go to the previous/next title.
 #define MAX_TITLES 99
@@ -1555,7 +1555,9 @@ static int titles_choose(int largest_vts) {
         group++;
         if (first < 0) first = i;
     }
-    series = group >= 3;
+    // two or more separate titles of similar length: episodes / parts
+    // (versions of one film share their sectors and were excluded above)
+    series = group >= 2;
     if (!series)
         for (int i = 0; i < ntitles; i++) titles[i].in_series = 0;
     return series ? first : main_t;
