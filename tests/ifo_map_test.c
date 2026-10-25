@@ -99,6 +99,64 @@ int main(void) {
            !strcmp(audio_name[1], "English, AC3 stereo, director's comments"));
     assert(sub_sid_list[0] == 0x21 && !strcmp(sub_name[0], "Danish"));     // wide stream ids
     assert(sub_sid_list[1] == 0x23 && !strcmp(sub_name[1], "English, large"));
+
+    // ---- title table: a series disc ----
+    // VTS 1: 4 episodes (PGC 1-4, ~45 min each) + an extra (PGC 5, 10 min)
+    //        + a decoy PGC 6 claiming 1:30:00 with almost no data
+    static cell_playback_t ec[6];
+    static pgc_t ep[6];
+    static pgci_srp_t esrp[6];
+    static pgcit_t epgcit;
+    static ptt_info_t eptt[6];
+    static ttu_t ettu[6];
+    static vts_ptt_srpt_t eptts;
+    static vtsi_mat_t emat;
+    static ifo_handle_t evts, evmg;
+    static title_info_t eti[8];
+    static tt_srpt_t ett;
+    static const int mins[6] = { 47, 44, 45, 46, 10, 90 };
+    for (int i = 0; i < 6; i++) {
+        ec[i] = (cell_playback_t){0};
+        ec[i].first_sector = 1000000 * i;
+        ec[i].last_sector = 1000000 * i + (i == 5 ? 9 : 799999);  // ~300 blocks/s; decoy: 10 blocks
+        ec[i].playback_time = T(mins[i] / 60, mins[i] % 60, 0, 0);
+        ep[i] = (pgc_t){0};
+        ep[i].nr_of_cells = 1; ep[i].cell_playback = &ec[i];
+        ep[i].playback_time = ec[i].playback_time;
+        esrp[i].pgc = &ep[i];
+        eptt[i].pgcn = i + 1; eptt[i].pgn = 1;
+        ettu[i].nr_of_ptts = 1; ettu[i].ptt = &eptt[i];
+    }
+    epgcit.nr_of_pgci_srp = 6; epgcit.pgci_srp = esrp;
+    eptts.nr_of_srpts = 6; eptts.title = ettu;
+    evts.vts_pgcit = &epgcit; evts.vts_ptt_srpt = &eptts; evts.vtsi_mat = &emat;
+    vts_ifo[1] = &evts;                   // what ifoOpen() would return
+    vts_blocks[1] = 6000000;
+    // title table order: extra, ep1, ep2, decoy, ep3, ep4, ep2 again (duplicate)
+    static const int order[7] = { 5, 1, 2, 6, 3, 4, 2 };
+    for (int i = 0; i < 7; i++) {
+        eti[i] = (title_info_t){0};
+        eti[i].title_set_nr = 1; eti[i].vts_ttn = order[i]; eti[i].nr_of_ptts = 1;
+    }
+    ett.nr_of_srpts = 7; ett.title = eti;
+    evmg.tt_srpt = &ett;
+
+    titles_from_vmg(&evmg);
+    int start = titles_choose(1);
+    titles_print(start);
+    assert(ntitles == 5);                 // decoy and duplicate dropped
+    assert(titles[0].pgcn == 5 && titles[1].pgcn == 1 && titles[4].pgcn == 4);
+    assert(series && start == 1);         // starts at episode 1, not the extra
+    assert(next_series_title(1) == 2 && next_series_title(3) == 4 && next_series_title(4) == -1);
+    assert(next_series_title(0) == 1);    // after the extra: the episodes
+
+    // a movie disc: one long title + extras -> no series, start at the film
+    ntitles = 0;
+    titles[ntitles++] = (dvdtitle_t){ 1, 1, NULL, 6300, 20 };
+    titles[ntitles++] = (dvdtitle_t){ 1, 2, NULL, 600, 1 };
+    titles[ntitles++] = (dvdtitle_t){ 1, 3, NULL, 900, 1 };
+    start = titles_choose(1);
+    assert(!series && start == 0 && next_series_title(0) == -1);
     printf("OK\n");
     return 0;
 }
