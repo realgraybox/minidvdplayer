@@ -921,10 +921,24 @@ static void title_map_reset(void) {
 }
 
 #ifndef TEST_PLAIN_VOB
+// A cell that can really be played. Copy protection (e.g. Sony ARccOS) puts
+// dummy cells on unreadable sectors into the film's program chain and makes
+// real players jump over them with navigation commands. Those cells carry
+// impossible values: their last VOBU does not start inside the cell, or they
+// have no playing time.
+static int cell_usable(const cell_playback_t *cp, uint32_t nblocks) {
+    return cp->first_sector <= cp->last_sector &&
+           cp->last_sector < nblocks &&
+           cp->last_vobu_start_sector >= cp->first_sector &&
+           cp->last_vobu_start_sector <= cp->last_sector &&
+           dvdtime_sec(&cp->playback_time) > 0.0;
+}
+
 // Build the map from one program chain (pgcn: its number, for the log).
 // 0 = unusable.
 static int title_map_from_pgc(pgc_t *pgc, int pgcn) {
     int cellidx[256];                     // PGC cell number -> our index
+    int invalid = 0;
 
     title_map_reset();
     if (!pgc || !pgc->nr_of_cells || !pgc->cell_playback) return 0;
@@ -935,8 +949,10 @@ static int title_map_from_pgc(pgc_t *pgc, int pgcn) {
         if (cp->block_type == BLOCK_TYPE_ANGLE_BLOCK &&
             cp->block_mode != BLOCK_MODE_FIRST_CELL)
             continue;
-        if (cp->first_sector > cp->last_sector || cp->last_sector >= total_blocks)
-            continue;                     // broken entry (e.g. copy protection)
+        if (!cell_usable(cp, total_blocks)) {   // broken / copy protection dummy
+            invalid++;
+            continue;
+        }
         title_add_cell(cp->first_sector, cp->last_sector,
                        dvdtime_sec(&cp->playback_time));
     }
@@ -951,6 +967,8 @@ static int title_map_from_pgc(pgc_t *pgc, int pgcn) {
     fprintf(stderr, "Title: PGC %d, %d:%02d:%02d, %d chapters, %d cells\n",
             pgcn, (int)title_len / 3600, ((int)title_len / 60) % 60,
             (int)title_len % 60, ntchap, ntcells);
+    if (invalid)
+        fprintf(stderr, "Title: skipped %d invalid cells (copy protection?)\n", invalid);
     return 1;
 }
 
@@ -1406,7 +1424,7 @@ static void titles_from_vmg(ifo_handle_t *vmg) {
         len = dvdtime_sec(&pgc->playback_time);
         for (int c = 0; c < pgc->nr_of_cells; c++) {
             cell_playback_t *cp = &pgc->cell_playback[c];
-            if (cp->first_sector <= cp->last_sector && cp->last_sector < vts_blocks[v]) {
+            if (cell_usable(cp, vts_blocks[v])) {
                 blocks += cp->last_sector - cp->first_sector + 1;
                 ok++;
             }
@@ -1426,7 +1444,7 @@ static void titles_from_vmg(ifo_handle_t *vmg) {
         titles[ntitles].blocks = blocks;
         for (int c = 0; titles[ntitles].rng && c < pgc->nr_of_cells; c++) {
             cell_playback_t *cp = &pgc->cell_playback[c];
-            if (cp->first_sector <= cp->last_sector && cp->last_sector < vts_blocks[v]) {
+            if (cell_usable(cp, vts_blocks[v])) {
                 titles[ntitles].rng[titles[ntitles].nrng][0] = cp->first_sector;
                 titles[ntitles].rng[titles[ntitles].nrng][1] = cp->last_sector;
                 titles[ntitles].nrng++;
