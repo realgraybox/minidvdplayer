@@ -865,6 +865,26 @@ static void draw_help_overlay(void) {
     int cy = video_y + video_h / 2 - U(150);
     int line = U(16);
     int y = cy;
+
+    // A black box behind the text, so it can be read over any picture:
+    // as wide as the longest line, from the title to the last entry.
+    {
+        int n = 0, chars = 12;      // "minidvd help"
+        for (int i = 0; help_entries[i].key; i++, n++) {
+            int c = 13 + xbf_strlen(help_entries[i].desc);   // "%-12s " + text
+            int k = xbf_strlen(help_entries[i].key);
+            if (k > 12) c += k - 12;
+            if (c > chars) chars = c;
+        }
+        int pad = U(12);
+        int top = cy - xbf_ascent(txt) - pad;
+        int bottom = cy + line * (2 + n) + xbf_descent(txt) + pad;  // last baseline: cy + line*(2+n)
+        XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
+        XFillRectangle(dpy, win, gc, cx - pad, top,
+                       chars * xbf_char_width(txt) + 2 * pad, bottom - top);
+        XSetForeground(dpy, gc, fg);
+    }
+
     xbf_draw(txt, win, cx, y, fg, "minidvd help");
     y += line * 2;
     xbf_draw(txt, win, cx, y, fg, "Keys:");
