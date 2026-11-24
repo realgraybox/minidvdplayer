@@ -111,12 +111,17 @@ OBJS= $(SRCS:.c=.o)
 TARGET = minidvd
 
 CFLAGS += -Wall -Wunused -std=gnu99 -I./$(DVDREAD_DIR)/src -I./ \
-		-I./$(MPEG2_DIR)/include -I./$(A52_DIR)/include -I./audio \
+		-I./$(MPEG2_DIR)/include -I./$(A52_DIR)/include -I./audio -I./xbmfont \
 		-Os -ffunction-sections -fdata-sections -Wno-deprecated-declarations \
 		-ffast-math -fno-math-errno \
 		$(AUDIO_CFLAGS) $(EXTRA_CFLAGS)
 
 X11_LIBS ?= $(shell pkg-config $(if $(STATIC),--static) --libs xrender xext x11 2>/dev/null || echo -lXrender -lXext -lX11)
+
+# make SMALL_FONTS=1 : only the 6x13 font (scaled on large screens), about 17 KB smaller
+ifeq ($(SMALL_FONTS),1)
+CFLAGS += -DMINIDVD_SMALL_FONTS
+endif
 
 LDFLAGS = $(STATIC) -Wl,--gc-sections,--sort-common,-s
 LDLIBS  = $(LIB_ARCHIVES) $(X11_LIBS) -lm

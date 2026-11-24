@@ -79,6 +79,16 @@
 
 #include "audio.h"	//audio/audio.c: tinyalsa + OSS
 
+// Text (help screen, messages): xbmfont (xbmfont/), bitmap fonts built into
+// the program, so they look the same on every X server. 6x13 looks like X's
+// own "fixed" font; the text grows with the window (fullscreen on a big screen).
+#define XBMFONT_IMPLEMENTATION
+#include "xbmfont.h"
+#include "fonts/xbf_fixed_6x13.h"
+#ifndef MINIDVD_SMALL_FONTS
+#include "fonts/xbf_fixed_10x20.h"	// sharper text on large screens (about 17 KB)
+#endif
+
 
 
 /*
@@ -226,6 +236,25 @@ static int video_w = 720;
 static int video_h = 576;
 static int win_w = 720;
 static int win_h = 576;
+
+// ------------------ text size ------------------
+// The help screen and messages are designed for a 720x576 window with a 13 px
+// font; in a bigger window they use the largest size whose scaled layout fits.
+typedef struct { const xbf_font *font; int scale; } text_size_t;
+static const text_size_t text_sizes[] = {
+#ifndef MINIDVD_SMALL_FONTS
+    { &xbf_fixed_6x13, 1 }, { &xbf_fixed_10x20, 1 }, { &xbf_fixed_6x13, 2 },
+    { &xbf_fixed_10x20, 2 }, { &xbf_fixed_10x20, 3 }, { &xbf_fixed_10x20, 4 },
+#else
+    { &xbf_fixed_6x13, 1 }, { &xbf_fixed_6x13, 2 }, { &xbf_fixed_6x13, 3 },
+    { &xbf_fixed_6x13, 4 }, { &xbf_fixed_6x13, 6 },
+#endif
+};
+#define N_TEXT_SIZES ((int)(sizeof text_sizes / sizeof text_sizes[0]))
+static xbf_ctx *txt = NULL;
+static int txt_size = -1;	// index in text_sizes
+static int txt_unit = 13;	// line height of the current size (13 = base)
+#define U(x) (((x) * txt_unit + 6) / 13)	// a base-size measure at the current size
 static Display *dpy;
 static Window win;
 static GC gc;
@@ -811,14 +840,34 @@ static const struct help_entry help_entries[] = {
     { NULL, NULL }
 };
 
+// Text font for the current window size; uploaded again only when the size
+// changes. False if X could not take it (nothing is drawn then).
+static int text_ready(void) {
+    int want = 0;
+    for (int i = 1; i < N_TEXT_SIZES; i++) {
+        int line = text_sizes[i].font->height * text_sizes[i].scale;
+        if (line * 720 <= win_w * 13 && line * 576 <= win_h * 13) want = i;
+    }
+    if (txt && want == txt_size) return 1;
+    xbf_ctx *t = xbf_create(dpy, win, text_sizes[want].font, text_sizes[want].scale);
+    if (!t) return txt != NULL;
+    xbf_free(txt);
+    txt = t;
+    txt_size = want;
+    txt_unit = text_sizes[want].font->height * text_sizes[want].scale;
+    return 1;
+}
+
 static void draw_help_overlay(void) {
-    int cx = video_x + video_w / 2 - 150;
-    int cy = video_y + video_h / 2 - 150;
-    int line = 16;
+    if (!text_ready()) return;
+    unsigned long fg = WhitePixel(dpy, DefaultScreen(dpy));
+    int cx = video_x + video_w / 2 - U(150);
+    int cy = video_y + video_h / 2 - U(150);
+    int line = U(16);
     int y = cy;
-    XDrawString(dpy, win, gc, cx, y, "minidvd help", 12);
+    xbf_draw(txt, win, cx, y, fg, "minidvd help");
     y += line * 2;
-    XDrawString(dpy, win, gc, cx, y, "Keys:", 5);
+    xbf_draw(txt, win, cx, y, fg, "Keys:");
     y += line;
     for (int i = 0; help_entries[i].key; i++) {
         char buf[128];
@@ -826,7 +875,7 @@ static void draw_help_overlay(void) {
                  help_entries[i].key,
                  help_entries[i].desc);
 
-        XDrawString(dpy, win, gc, cx, y, buf, strlen(buf));
+        xbf_draw(txt, win, cx, y, fg, buf);
         y += line;
     }
 }
@@ -1149,13 +1198,16 @@ static void osd_show(double t) {
 }
 
 static void draw_osd(void) {
-    int w;
+    int w, max_px;
     if (!osd_text[0] || now_us() > osd_until_us) return;
-    w = 8 + 6 * (int)strlen(osd_text);   // "fixed" font: 6 px per char
+    if (!text_ready()) return;
+    max_px = win_w - U(28);			// a long message ends in "..."
+    w = U(8) + xbf_fit_width(txt, osd_text, max_px);
     XSetForeground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
-    XFillRectangle(dpy, win, gc, 10, 10, w, 20);
+    XFillRectangle(dpy, win, gc, U(10), U(10), w, U(20));
     XSetForeground(dpy, gc, WhitePixel(dpy, DefaultScreen(dpy)));
-    XDrawString(dpy, win, gc, 14, 25, osd_text, strlen(osd_text));
+    xbf_draw_fit(txt, win, U(14), U(25), WhitePixel(dpy, DefaultScreen(dpy)),
+                 osd_text, max_px, XBF_CUT_END);
 }
 
 // ------------------ audio / subtitle streams ------------------
@@ -1932,8 +1984,6 @@ static void x11_init(int w, int h) {
     XSetForeground(dpy, gc, WhitePixel(dpy, DefaultScreen(dpy)));
 	XSetBackground(dpy, gc, BlackPixel(dpy, DefaultScreen(dpy)));
 
-	XFontStruct *font = XLoadQueryFont(dpy, "fixed");
-	if (font) XSetFont(dpy, gc, font->fid);
 
     // MIT-SHM: the X server reads frames straight from shared memory instead
     // of receiving them through the socket. Off for remote displays (it
@@ -3221,6 +3271,7 @@ int main(int argc, char **argv) {
 	if (ximg) {
 		destroy_ximage();
 	}
+	xbf_free(txt);
 	XFreeGC(dpy, gc);
 	XDestroyWindow(dpy, win);
 	XCloseDisplay(dpy);

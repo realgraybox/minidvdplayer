@@ -33,6 +33,12 @@ Useful variables (on the make command line):
     make STATIC=-static                                              # force a static binary
     make LIB_CFLAGS="..." LIB_LDFLAGS="..."                          # library flags
     make X11_LIBS="-lXrender -lXext -lX11 -lxcb -lXau -lXdmcp"       # custom X11 link line
+    make SMALL_FONTS=1                                               # only the 6x13 font (about 17 KB smaller)
+
+The help screen and messages are drawn with fonts built into the program
+(xbmfont, bundled in `xbmfont/`), so they look the same on every X server and
+need no server fonts. They grow with the window: in fullscreen on a large
+screen they use a larger font (10x20, then doubled ...).
 
 Targets: `make` / `make all`, `make install` (to `/usr/bin`, honours
 `DESTDIR`), `make libs`, `make clean` (minidvd only), `make libs-clean`,
@@ -134,6 +140,7 @@ The bundled libraries keep their own licenses:
 | libmpeg2 0.5.1 | GPL-2.0-or-later |
 | liba52 (a52dec) 0.8.0 | GPL-2.0-or-later |
 | tinyalsa (`audio/pcm.c`, `audio/pcm.h`, `audio/asoundlib.h`), Copyright 2011 The Android Open Source Project | BSD-3-Clause (see the file headers) |
+| xbmfont (`xbmfont/`) | zlib; its fonts (X11 misc-fixed) are public domain |
 
 A minidvd binary is linked with the GPL libraries above, so the binary as a
 whole is covered by the GPL-2.0-or-later: if you distribute it, the
